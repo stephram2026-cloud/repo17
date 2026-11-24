@@ -1,0 +1,4055 @@
+diff --git a/packages/desktop-client/src/components/modals/ImportTransactionsModal/ImportTransactionsModal.tsx b/packages/desktop-client/src/components/modals/ImportTransactionsModal/ImportTransactionsModal.tsx
+index cd2dd3b13..95112fb57 100644
+--- a/packages/desktop-client/src/components/modals/ImportTransactionsModal/ImportTransactionsModal.tsx
++++ b/packages/desktop-client/src/components/modals/ImportTransactionsModal/ImportTransactionsModal.tsx
+@@ -299,8 +299,10 @@ export function ImportTransactionsModal({
+     ) => {
+       const previewTransactions = [];
+       const inOutModeEnabled = isOfxFile(filetype) ? false : inOutMode;
++      // OFX and CAMT files are parsed on the server and already carry ISO
++      // dates, and no date format is selected for them.
+       const getTransDate: (trans: ImportTransaction) => string | null =
+-        isOfxFile(filetype)
++        isOfxFile(filetype) || isCamtFile(filetype)
+           ? trans => trans.date ?? null
+           : trans => parseDate(trans.date, parseDateFormat);
+ 
+diff --git a/packages/desktop-client/src/components/reports/spreadsheets/budgetDataQuery.ts b/packages/desktop-client/src/components/reports/spreadsheets/budgetDataQuery.ts
+index ee5409666..14ead3b07 100644
+--- a/packages/desktop-client/src/components/reports/spreadsheets/budgetDataQuery.ts
++++ b/packages/desktop-client/src/components/reports/spreadsheets/budgetDataQuery.ts
+@@ -168,7 +168,8 @@ export function filterCategoriesByConditions<
+         return true;
+       }
+       try {
+-        return new RegExp(condition.value).test(textValue ?? '');
++        // Case-insensitive, like `matches` in transaction queries and rules
++        return new RegExp(condition.value, 'i').test(textValue ?? '');
+       } catch {
+         return false;
+       }
+diff --git a/packages/desktop-client/src/components/reports/spreadsheets/categoryRows.test.ts b/packages/desktop-client/src/components/reports/spreadsheets/categoryRows.test.ts
+index 2df51ddac..659b997a7 100644
+--- a/packages/desktop-client/src/components/reports/spreadsheets/categoryRows.test.ts
++++ b/packages/desktop-client/src/components/reports/spreadsheets/categoryRows.test.ts
+@@ -343,7 +343,7 @@ it('preserves transactions matching another branch of a mixed-field OR', async (
+ it.each<RuleConditionEntity[]>([
+   [{ field: 'category', op: 'oneOf', value: [] }],
+   [{ field: 'category', op: 'notOneOf', value: [] }],
+-  [{ field: 'category', op: 'matches', value: '^rent$' }],
++  [{ field: 'category', op: 'matches', value: '^no such category$' }],
+   [
+     { field: 'category', op: 'is', value: 'rent' },
+     { field: 'category', op: 'is', value: 'utilities' },
+@@ -361,6 +361,13 @@ it.each<RuleConditionEntity[]>([
+   },
+ );
+ 
++it('matches category regexes case-insensitively, like queries', async () => {
++  const { rows } = await build({
++    conditions: [{ field: 'category', op: 'matches', value: '^RENT$' }],
++  });
++  expect(rows.map(row => row.name)).toEqual(['Rent']);
++});
++
+ it('matches category names with the same wildcard semantics as queries', async () => {
+   const { rows } = await build({
+     conditions: [{ field: 'category', op: 'contains', value: 'R?N%' }],
+diff --git a/packages/desktop-client/src/components/settings/RepairTransactions.tsx b/packages/desktop-client/src/components/settings/RepairTransactions.tsx
+index 9c14d8a4d..e9a8acbba 100644
+--- a/packages/desktop-client/src/components/settings/RepairTransactions.tsx
++++ b/packages/desktop-client/src/components/settings/RepairTransactions.tsx
+@@ -25,6 +25,7 @@ function useRenderResults() {
+       mismatchedSplits,
+       numNonParentErrorsFixed,
+       numParentTransactionsWithCategoryFixed,
++      numSplitLinesMoved,
+     } = results;
+     const result: string[] = [];
+ 
+@@ -35,7 +36,8 @@ function useRenderResults() {
+       numTransfersFixed === 0 &&
+       numNonParentErrorsFixed === 0 &&
+       mismatchedSplits.length === 0 &&
+-      numParentTransactionsWithCategoryFixed === 0
++      numParentTransactionsWithCategoryFixed === 0 &&
++      numSplitLinesMoved === 0
+     ) {
+       result.push(t('No split transactions found needing repair.'));
+     } else {
+@@ -86,6 +88,14 @@ function useRenderResults() {
+           ) + `\n${mismatchedSplitInfo}`,
+         );
+       }
++      if (numSplitLinesMoved > 0) {
++        result.push(
++          t(
++            'Moved {{count}} split lines back to the date and account of their split.',
++            { count: numSplitLinesMoved },
++          ),
++        );
++      }
+       if (numParentTransactionsWithCategoryFixed > 0) {
+         result.push(
+           t('Fixed {{count}} split transactions with non-null category.', {
+diff --git a/packages/desktop-client/src/global-events.ts b/packages/desktop-client/src/global-events.ts
+index b8ff18ba9..cd061e0ba 100644
+--- a/packages/desktop-client/src/global-events.ts
++++ b/packages/desktop-client/src/global-events.ts
+@@ -4,6 +4,7 @@ import {
+ } from '@actual-app/core/platform/client/browser-preload';
+ import { listen, send } from '@actual-app/core/platform/client/connection';
+ import * as undo from '@actual-app/core/platform/client/undo';
++import { integerToCurrency } from '@actual-app/core/shared/util';
+ // @ts-strict-ignore
+ import type { QueryClient } from '@tanstack/react-query';
+ import { t } from 'i18next';
+@@ -17,6 +18,7 @@ import type { Modal } from './modals/modalsSlice';
+ import {
+   addGenericErrorNotification,
+   addNotification,
++  removeNotification,
+ } from './notifications/notificationsSlice';
+ import { payeeQueries } from './payees';
+ import { loadPrefs } from './prefs/prefsSlice';
+@@ -54,6 +56,135 @@ export function handleGlobalEvents(store: AppStore, queryClient: QueryClient) {
+     );
+   });
+ 
++  // Both sides of a transfer were changed to different amounts on two
++  // devices. Nothing is changed automatically; keep a warning up, listing
++  // both figures, until someone corrects the wrong side.
++  const unlistenTransferMismatches = listen(
++    'transfer-mismatches',
++    ({ mismatches }) => {
++      const id = 'transfer-mismatches';
++      store.dispatch(removeNotification({ id }));
++      if (mismatches.length === 0) {
++        return;
++      }
++      const lines = mismatches.map(m =>
++        t(
++          '{{date}}: {{account}} {{amount}} but {{otherAccount}} {{otherAmount}}',
++          {
++            date: m.date,
++            account: m.accountName,
++            amount: integerToCurrency(m.amount),
++            otherAccount: m.otherAccountName,
++            otherAmount: integerToCurrency(m.otherAmount),
++          },
++        ),
++      );
++      store.dispatch(
++        addNotification({
++          notification: {
++            id,
++            type: 'warning',
++            sticky: true,
++            title: t('Transfers changed on two devices'),
++            message:
++              t(
++                'These transfers were given different amounts on each side by edits on two devices at the same time. Nothing was changed. For each one, change the side with the wrong amount to the right amount:',
++              ) +
++              '\n' +
++              lines.join('\n'),
++          },
++        }),
++      );
++    },
++  );
++
++  // The same bank transaction exists more than once in an account (older
++  // data, or a manual entry made on one device just before the other
++  // imported). Nothing is merged automatically.
++  const unlistenDuplicateImports = listen(
++    'duplicate-imports',
++    ({ duplicates }) => {
++      const id = 'duplicate-imports';
++      store.dispatch(removeNotification({ id }));
++      if (duplicates.length === 0) {
++        return;
++      }
++      const lines = duplicates.map(d =>
++        t('{{date}}: {{account}} {{amount}} ({{count}} copies)', {
++          date: d.date,
++          account: d.accountName,
++          amount: integerToCurrency(d.amount),
++          count: d.count,
++        }),
++      );
++      store.dispatch(
++        addNotification({
++          notification: {
++            id,
++            type: 'warning',
++            sticky: true,
++            title: t('Duplicate bank transactions'),
++            message:
++              t(
++                'These bank transactions appear more than once in the same account. Nothing was changed. Select the copies and merge them, or delete the extras:',
++              ) +
++              '\n' +
++              lines.join('\n'),
++          },
++        }),
++      );
++    },
++  );
++
++  // An account linked to the bank on two devices before they synced had two
++  // opening balances; the later one was removed (or, if changed by hand,
++  // kept). Only reported when the figures don't add up.
++  const unlistenOpeningBalanceConflicts = listen(
++    'opening-balance-conflicts',
++    ({ conflicts }) => {
++      const lines = conflicts.map(c =>
++        c.removed
++          ? t(
++              '{{account}}: kept {{amount}} on {{date}}. Removed the {{otherAmount}} from the other device, dated {{otherDate}}, which should have been {{expectedAmount}} to match.',
++              {
++                account: c.accountName,
++                amount: integerToCurrency(c.amount),
++                date: c.date,
++                otherAmount: integerToCurrency(c.otherAmount),
++                otherDate: c.otherDate,
++                expectedAmount: integerToCurrency(c.expectedAmount),
++              },
++            )
++          : t(
++              '{{account}}: {{amount}} on {{date}} and {{otherAmount}} on {{otherDate}}. The later one was changed by hand, so nothing was removed; delete whichever is wrong.',
++              {
++                account: c.accountName,
++                amount: integerToCurrency(c.amount),
++                date: c.date,
++                otherAmount: integerToCurrency(c.otherAmount),
++                otherDate: c.otherDate,
++              },
++            ),
++      );
++      store.dispatch(
++        addNotification({
++          notification: {
++            id: 'opening-balance-conflicts',
++            type: 'warning',
++            sticky: true,
++            title: t('Opening balances differ between devices'),
++            message:
++              t(
++                'These accounts were linked to the bank on two devices before they synced, and the opening balances the devices worked out do not agree. Check these balances against your bank:',
++              ) +
++              '\n' +
++              lines.join('\n'),
++          },
++        }),
++      );
++    },
++  );
++
+   const unlistenSync = syncEvents.listenForSyncEvent(store, queryClient);
+ 
+   const unlistenUndo = listen('undo-event', undoState => {
+@@ -328,6 +459,9 @@ export function handleGlobalEvents(store: AppStore, queryClient: QueryClient) {
+     unlistenServerError();
+     unlistenOrphanedPayees();
+     unlistenSchedulesOffline();
++    unlistenTransferMismatches();
++    unlistenDuplicateImports();
++    unlistenOpeningBalanceConflicts();
+     unlistenSync();
+     unlistenUndo();
+     unlistenFallbackWriteError();
+diff --git a/packages/loot-core/src/mocks/setup.ts b/packages/loot-core/src/mocks/setup.ts
+index f45e17842..515db2c3b 100644
+--- a/packages/loot-core/src/mocks/setup.ts
++++ b/packages/loot-core/src/mocks/setup.ts
+@@ -1,6 +1,8 @@
+-// @ts-strict-ignore
+ import * as nativeFs from 'fs';
+ 
++// @ts-strict-ignore
++import type { v5 as uuidv5 } from 'uuid';
++
+ import * as fetchClient from '#platform/client/connection';
+ import * as sqlite from '#platform/server/sqlite';
+ import * as db from '#server/db';
+@@ -58,10 +60,12 @@ global.resetRandomId = () => {
+   _id = 1;
+ };
+ 
+-vi.mock('uuid', () => ({
++vi.mock('uuid', async () => ({
+   v4: () => {
+     return 'id' + _id++;
+   },
++  // Name-based ids are already deterministic
++  v5: (await vi.importActual<{ v5: typeof uuidv5 }>('uuid')).v5,
+ }));
+ vi.mock('#server/migrate/migrations', async () => {
+   const realMigrations = await vi.importActual<typeof MigrationsType>(
+diff --git a/packages/loot-core/src/platform/server/connection/index.api.ts b/packages/loot-core/src/platform/server/connection/index.api.ts
+index 214e86e91..e937d802c 100644
+--- a/packages/loot-core/src/platform/server/connection/index.api.ts
++++ b/packages/loot-core/src/platform/server/connection/index.api.ts
+@@ -7,9 +7,39 @@ export const init: T.Init = function () {
+   // Nothing
+ };
+ 
+-// The API has no UI for server events; the two below mean synced data is
+-// parked on (or lost from) this device, so surface them to the script author
++// The API has no UI for server events; the ones below mean synced data is
++// parked on (or lost from) this device, or needs someone to decide, so
++// surface them to the script author
+ export const send: T.Send = function (type, args) {
++  if (type === 'transfer-mismatches' && args) {
++    const { mismatches } = args as ServerEvents['transfer-mismatches'];
++    for (const m of mismatches) {
++      logger.warn(
++        `Transfer on ${m.date} has different amounts on each side after edits on two devices (${m.accountName}: ${m.amount}, ${m.otherAccountName}: ${m.otherAmount}). Nothing was changed; change the side with the wrong amount to the right amount.`,
++      );
++    }
++    return;
++  }
++  if (type === 'duplicate-imports' && args) {
++    const { duplicates } = args as ServerEvents['duplicate-imports'];
++    for (const d of duplicates) {
++      logger.warn(
++        `Bank transaction ${d.importedId} (${d.date}, ${d.amount}) is in ${d.accountName} ${d.count} times. Nothing was changed; merge or delete the extra copies.`,
++      );
++    }
++    return;
++  }
++  if (type === 'opening-balance-conflicts' && args) {
++    const { conflicts } = args as ServerEvents['opening-balance-conflicts'];
++    for (const c of conflicts) {
++      logger.warn(
++        c.removed
++          ? `${c.accountName} was linked to the bank on two devices. Kept the opening balance of ${c.amount} on ${c.date}; removed the other device's opening balance of ${c.otherAmount} on ${c.otherDate} so it is not counted twice, but it should have been ${c.expectedAmount} to match. Check the account balance against the bank.`
++          : `${c.accountName} has two opening balances: ${c.amount} on ${c.date} and ${c.otherAmount} on ${c.otherDate}. The later one was changed by hand, so nothing was removed; delete whichever is wrong.`,
++      );
++    }
++    return;
++  }
+   if (type !== 'sync-event' || !args) {
+     return;
+   }
+diff --git a/packages/loot-core/src/platform/server/sqlite/engine.sqljs.legacy.ts b/packages/loot-core/src/platform/server/sqlite/engine.sqljs.legacy.ts
+index 86d4f4135..ff4b40e94 100644
+--- a/packages/loot-core/src/platform/server/sqlite/engine.sqljs.legacy.ts
++++ b/packages/loot-core/src/platform/server/sqlite/engine.sqljs.legacy.ts
+@@ -5,7 +5,7 @@ import type { Database, SqlJsStatic, Statement } from '@jlongster/sql.js';
+ import { logger } from '#platform/server/log';
+ 
+ import { normalise } from './normalise';
+-import { regexp } from './regexp';
++import { regexp, regexpNoCase } from './regexp';
+ import { BudgetInUseError, StorageUnavailableError } from './storage/errors';
+ import { getSqliteFileRow } from './storage/files-store';
+ import {
+@@ -233,6 +233,7 @@ export async function openDatabase(pathOrBuffer?: string | Uint8Array) {
+   db.create_function('UNICODE_UPPER', arg => arg?.toUpperCase());
+   db.create_function('UNICODE_LIKE', unicodeLike);
+   db.create_function('REGEXP', regexp);
++  db.create_function('REGEXP_NOCASE', regexpNoCase);
+   db.create_function('NORMALISE', normalise);
+   return db;
+ }
+diff --git a/packages/loot-core/src/platform/server/sqlite/index.electron.ts b/packages/loot-core/src/platform/server/sqlite/index.electron.ts
+index 7b4bb2445..3b0419695 100644
+--- a/packages/loot-core/src/platform/server/sqlite/index.electron.ts
++++ b/packages/loot-core/src/platform/server/sqlite/index.electron.ts
+@@ -6,7 +6,7 @@ import { getDataDir, readFile, removeFile } from '#platform/server/fs';
+ import { logger } from '#platform/server/log';
+ 
+ import { normalise } from './normalise';
+-import { regexp } from './regexp';
++import { regexp, regexpNoCase } from './regexp';
+ import type { FileStoreKind } from './storage/types';
+ import type {
+   Database,
+@@ -193,6 +193,7 @@ export function openDatabase(pathOrBuffer: string | Buffer): Database {
+   );
+   db.function('UNICODE_LIKE', { deterministic: true }, unicodeLike);
+   db.function('REGEXP', { deterministic: true }, regexp);
++  db.function('REGEXP_NOCASE', { deterministic: true }, regexpNoCase);
+   db.function('NORMALISE', { deterministic: true }, normalise);
+   return db as unknown as Database;
+ }
+diff --git a/packages/loot-core/src/platform/server/sqlite/regexp.test.ts b/packages/loot-core/src/platform/server/sqlite/regexp.test.ts
+index 0f66a584e..fdfe726e9 100644
+--- a/packages/loot-core/src/platform/server/sqlite/regexp.test.ts
++++ b/packages/loot-core/src/platform/server/sqlite/regexp.test.ts
+@@ -1,4 +1,4 @@
+-import { regexp } from './regexp';
++import { regexp, regexpNoCase } from './regexp';
+ 
+ describe('REGEXP functionality', () => {
+   it('should match a valid pattern', () => {
+@@ -22,3 +22,19 @@ describe('REGEXP functionality', () => {
+     expect(regexp('(', null)).toBe(0);
+   });
+ });
++
++describe('REGEXP_NOCASE functionality', () => {
++  it('matches regardless of case', () => {
++    expect(regexpNoCase('^AMAZON', 'amazon.com')).toBe(1);
++    expect(regexp('^AMAZON', 'amazon.com')).toBe(0);
++  });
++
++  it('keeps uppercase escapes intact', () => {
++    expect(regexpNoCase('^\\D+$', 'ABC')).toBe(1);
++    expect(regexpNoCase('^\\D+$', '123')).toBe(0);
++  });
++
++  it('does not match anything with an invalid pattern', () => {
++    expect(regexpNoCase('[', '[')).toBe(0);
++  });
++});
+diff --git a/packages/loot-core/src/platform/server/sqlite/regexp.ts b/packages/loot-core/src/platform/server/sqlite/regexp.ts
+index 81548bcb2..2c565cbe5 100644
+--- a/packages/loot-core/src/platform/server/sqlite/regexp.ts
++++ b/packages/loot-core/src/platform/server/sqlite/regexp.ts
+@@ -1,8 +1,19 @@
+ export function regexp(regex: string | null, text: string | null) {
++  return testRegexp(regex, text, '');
++}
++
++// Case-insensitive variant, used by rule and filter `matches` conditions.
++// The pattern is used exactly as typed: lowercasing it instead would turn
++// escapes like `\D` or `\S` into their opposites.
++export function regexpNoCase(regex: string | null, text: string | null) {
++  return testRegexp(regex, text, 'i');
++}
++
++function testRegexp(regex: string | null, text: string | null, flags: string) {
+   let pattern: RegExp;
+   try {
+     // A NULL pattern coerces to the text 'null', as it always has
+-    pattern = new RegExp(String(regex));
++    pattern = new RegExp(String(regex), flags);
+   } catch {
+     // An invalid pattern, such as one still being typed into a rule
+     // condition, matches nothing instead of failing the whole query. This
+diff --git a/packages/loot-core/src/platform/server/sqlite/wasm.ts b/packages/loot-core/src/platform/server/sqlite/wasm.ts
+index c1424a602..64a0879a6 100644
+--- a/packages/loot-core/src/platform/server/sqlite/wasm.ts
++++ b/packages/loot-core/src/platform/server/sqlite/wasm.ts
+@@ -8,7 +8,7 @@ import type {
+ import { logger } from '#platform/server/log';
+ 
+ import { normalise } from './normalise';
+-import { regexp } from './regexp';
++import { regexp, regexpNoCase } from './regexp';
+ import { unicodeLike } from './unicodeLike';
+ 
+ export type { WasmDatabase, PreparedStatement };
+@@ -129,6 +129,9 @@ export function installUserFunctions(db: WasmDatabase) {
+     unicodeLike(pattern, value),
+   );
+   defineFunction(db, 'REGEXP', 2, (pattern, text) => regexp(pattern, text));
++  defineFunction(db, 'REGEXP_NOCASE', 2, (pattern, text) =>
++    regexpNoCase(pattern, text),
++  );
+   defineFunction(db, 'NORMALISE', 1, value => normalise(value));
+ }
+ 
+diff --git a/packages/loot-core/src/server/__snapshots__/main.test.ts.snap b/packages/loot-core/src/server/__snapshots__/main.test.ts.snap
+index e3df0e0a2..98db06da1 100644
+--- a/packages/loot-core/src/server/__snapshots__/main.test.ts.snap
++++ b/packages/loot-core/src/server/__snapshots__/main.test.ts.snap
+@@ -25,7 +25,7 @@ exports[`Accounts > Transfers are properly updated 1`] = `
+     "sort_order": 123456789,
+     "starting_balance_flag": 0,
+     "tombstone": 0,
+-    "transferred_id": "id2",
++    "transferred_id": "7fbae23d-df62-5504-8829-7b2d536c151c",
+     "type": null,
+   },
+   {
+@@ -37,7 +37,7 @@ exports[`Accounts > Transfers are properly updated 1`] = `
+     "description": "transfer-one",
+     "error": null,
+     "financial_id": null,
+-    "id": "id2",
++    "id": "7fbae23d-df62-5504-8829-7b2d536c151c",
+     "imported_description": null,
+     "isChild": 0,
+     "isParent": 0,
+@@ -78,7 +78,7 @@ exports[`Accounts > Transfers are properly updated 2`] = `
+       "isChild": 0,
+ @@ -24,11 +24,11 @@
+       "tombstone": 0,
+-      "transferred_id": "id2",
++      "transferred_id": "7fbae23d-df62-5504-8829-7b2d536c151c",
+       "type": null,
+     },
+     Object {
+@@ -102,7 +102,7 @@ exports[`Accounts > Transfers are properly updated 3`] = `
+       "sort_order": 123456789,
+       "starting_balance_flag": 0,
+ -     "tombstone": 0,
+--     "transferred_id": "id2",
++-     "transferred_id": "7fbae23d-df62-5504-8829-7b2d536c151c",
+ +     "tombstone": 1,
+ +     "transferred_id": null,
+       "type": null,
+diff --git a/packages/loot-core/src/server/accounts/__snapshots__/sync.test.ts.snap b/packages/loot-core/src/server/accounts/__snapshots__/sync.test.ts.snap
+index 723f99bc7..83636d5be 100644
+--- a/packages/loot-core/src/server/accounts/__snapshots__/sync.test.ts.snap
++++ b/packages/loot-core/src/server/accounts/__snapshots__/sync.test.ts.snap
+@@ -9,7 +9,7 @@ exports[`Account sync > reconcile does rematch deleted transactions by default 1
+     "cleared": 1,
+     "date": 20200101,
+     "error": null,
+-    "id": "id3",
++    "id": "f274d842-08b2-5ded-8d36-3b2be0c5b304",
+     "imported_id": "finid",
+     "imported_payee": null,
+     "is_child": 0,
+@@ -33,7 +33,7 @@ exports[`Account sync > reconcile does rematch deleted transactions by default 1
+     "cleared": 1,
+     "date": 20200101,
+     "error": null,
+-    "id": "id4",
++    "id": "id3",
+     "imported_id": "finid",
+     "imported_payee": null,
+     "is_child": 0,
+@@ -62,7 +62,7 @@ exports[`Account sync > reconcile doesnt rematch deleted transactions if reimpor
+     "cleared": 1,
+     "date": 20200101,
+     "error": null,
+-    "id": "id3",
++    "id": "f274d842-08b2-5ded-8d36-3b2be0c5b304",
+     "imported_id": "finid",
+     "imported_payee": null,
+     "is_child": 0,
+@@ -91,7 +91,7 @@ exports[`Account sync > reconcile handles transactions with undefined fields 1`]
+     "cleared": 1,
+     "date": 20200102,
+     "error": null,
+-    "id": "id3",
++    "id": "3e77290b-bcc5-5d5b-9c98-ed97882e325b",
+     "imported_id": null,
+     "imported_payee": null,
+     "is_child": 0,
+diff --git a/packages/loot-core/src/server/accounts/opening-balances.test.ts b/packages/loot-core/src/server/accounts/opening-balances.test.ts
+new file mode 100644
+index 000000000..68019dd9f
+--- /dev/null
++++ b/packages/loot-core/src/server/accounts/opening-balances.test.ts
+@@ -0,0 +1,111 @@
++import { beforeEach, describe, expect, it } from 'vitest';
++
++import * as db from '#server/db';
++
++import {
++  openingBalanceIdParts,
++  resolveOpeningBalances,
++} from './opening-balances';
++import { stableId } from './stable-ids';
++
++beforeEach(global.emptyDatabase());
++
++// What bank sync adds when it links the account
++function bankSyncOpeningBalance(date: string, amount: number) {
++  return db.insertTransaction({
++    id: stableId(...openingBalanceIdParts('one', date, amount)),
++    account: 'one',
++    amount,
++    date,
++    starting_balance_flag: true,
++  });
++}
++
++async function setup() {
++  await db.insertAccount({ id: 'one', name: 'Joint' });
++  // Laptop A linked on day 1: its window starts on 2 November
++  await bankSyncOpeningBalance('2026-11-02', 100000);
++  await db.insertTransaction({
++    id: 'tesco',
++    account: 'one',
++    amount: -1250,
++    date: '2026-11-02',
++  });
++  await db.insertTransaction({
++    id: 'salary',
++    account: 'one',
++    amount: 250000,
++    date: '2026-11-05',
++  });
++}
++
++function openingBalances() {
++  return db.all<{ date: number; amount: number }>(
++    `SELECT date, amount FROM v_transactions_internal_alive
++      WHERE starting_balance_flag = 1 ORDER BY date`,
++  );
++}
++
++async function balance() {
++  const sum = await db.first<{ total: number }>(
++    `SELECT SUM(amount) AS total FROM v_transactions_internal_alive
++      WHERE account = 'one' AND is_parent = 0`,
++  );
++  return sum?.total;
++}
++
++describe('resolveOpeningBalances', () => {
++  it('leaves an account with one opening balance alone', async () => {
++    await setup();
++
++    expect(await resolveOpeningBalances()).toEqual([]);
++    expect(await openingBalances()).toEqual([
++      { date: 20261102, amount: 100000 },
++    ]);
++  });
++
++  it('keeps the earliest whole opening balance and removes a later one that adds up', async () => {
++    await setup();
++    // Laptop B linked a day later: its window starts on 3 November, so its
++    // opening balance already includes the Tesco transaction
++    await bankSyncOpeningBalance('2026-11-03', 98750);
++    expect(await balance()).toBe(100000 - 1250 + 250000 + 98750);
++
++    expect(await resolveOpeningBalances()).toEqual([]);
++    expect(await openingBalances()).toEqual([
++      { date: 20261102, amount: 100000 },
++    ]);
++    expect(await balance()).toBe(100000 - 1250 + 250000);
++  });
++
++  it('reports a later opening balance that does not add up', async () => {
++    await setup();
++    await bankSyncOpeningBalance('2026-11-03', 103750);
++
++    expect(await resolveOpeningBalances()).toEqual([
++      {
++        accountName: 'Joint',
++        date: '2026-11-02',
++        amount: 100000,
++        otherDate: '2026-11-03',
++        otherAmount: 103750,
++        expectedAmount: 98750,
++        removed: true,
++      },
++    ]);
++    expect(await openingBalances()).toEqual([
++      { date: 20261102, amount: 100000 },
++    ]);
++  });
++
++  it('reports, but does not remove, an opening balance changed by hand', async () => {
++    await setup();
++    const id = await bankSyncOpeningBalance('2026-11-03', 98750);
++    await db.updateTransaction({ id, amount: 99000 });
++
++    expect(await resolveOpeningBalances()).toEqual([
++      expect.objectContaining({ otherAmount: 99000, removed: false }),
++    ]);
++    expect(await openingBalances()).toHaveLength(2);
++  });
++});
+diff --git a/packages/loot-core/src/server/accounts/opening-balances.ts b/packages/loot-core/src/server/accounts/opening-balances.ts
+new file mode 100644
+index 000000000..424bd71a0
+--- /dev/null
++++ b/packages/loot-core/src/server/accounts/opening-balances.ts
+@@ -0,0 +1,119 @@
++import * as db from '#server/db';
++import { fromDateRepr } from '#server/models';
++
++import { stableId } from './stable-ids';
++
++/**
++ * What the id of the opening balance that bank sync adds when it links an
++ * account is made of: the account, and the date and amount of the balance.
++ */
++export function openingBalanceIdParts(
++  accountId: string,
++  date: string,
++  amount: number,
++) {
++  return ['opening-balance', accountId, date, amount] as const;
++}
++
++function isUntouchedBankSyncOpeningBalance(row: OpeningBalanceRow) {
++  const date = fromDateRepr(row.date);
++  return (
++    row.id === stableId(...openingBalanceIdParts(row.account, date, row.amount))
++  );
++}
++
++type OpeningBalanceRow = {
++  id: string;
++  account: string;
++  accountName: string;
++  date: number;
++  amount: number;
++};
++
++export type OpeningBalanceConflict = {
++  accountName: string;
++  /** The opening balance that stays: the earliest one */
++  date: string;
++  amount: number;
++  /** The other one */
++  otherDate: string;
++  otherAmount: number;
++  /** What the other one should be: the earliest plus the transactions up to it */
++  expectedAmount: number;
++  /** Whether the other one was removed (only untouched bank-sync ones are) */
++  removed: boolean;
++};
++
++/**
++ * Make sure an account has only one opening balance after two devices both
++ * linked it to the bank before syncing with each other.
++ *
++ * Linked on different days, the devices see different 90-day windows of
++ * transactions, so each works out a different opening balance (date and
++ * amount) and both arrive here. After syncing the account has the
++ * transactions of both windows, so only the earliest opening balance is
++ * right; a later one counts the transactions in between a second time. The
++ * later one is removed, but only if bank sync added it and nobody has
++ * changed it since.
++ *
++ * Nothing is lost when the later figure equals the earliest one plus the
++ * transactions in between. Otherwise, or when a later opening balance can't
++ * be removed, it is returned so that it can be reported.
++ */
++export async function resolveOpeningBalances(): Promise<
++  OpeningBalanceConflict[]
++> {
++  const rows = await db.all<OpeningBalanceRow>(
++    `SELECT t.id, t.account, a.name AS accountName, t.date, t.amount
++       FROM v_transactions_internal_alive t
++       JOIN accounts a ON a.id = t.account
++      WHERE t.starting_balance_flag = 1 AND t.is_child = 0
++        AND t.account IN (
++          SELECT account FROM v_transactions_internal_alive
++           WHERE starting_balance_flag = 1 AND is_child = 0
++           GROUP BY account HAVING COUNT(*) > 1
++        )
++      ORDER BY t.account, t.date, t.id`,
++  );
++
++  const byAccount = new Map<string, OpeningBalanceRow[]>();
++  for (const row of rows) {
++    byAccount.set(row.account, [...(byAccount.get(row.account) ?? []), row]);
++  }
++
++  const conflicts: OpeningBalanceConflict[] = [];
++  for (const [earliest, ...others] of byAccount.values()) {
++    // Only accounts where bank sync added one: the others are someone's own
++    // figures
++    if (![earliest, ...others].some(isUntouchedBankSyncOpeningBalance)) {
++      continue;
++    }
++    for (const other of others) {
++      const sum = await db.first<{ total: number }>(
++        `SELECT COALESCE(SUM(amount), 0) AS total
++           FROM v_transactions_internal_alive
++          WHERE account = ? AND is_parent = 0
++            AND (starting_balance_flag IS NULL OR starting_balance_flag = 0)
++            AND date >= ? AND date < ?`,
++        [earliest.account, earliest.date, other.date],
++      );
++      const expectedAmount = earliest.amount + (sum?.total ?? 0);
++      const removed = isUntouchedBankSyncOpeningBalance(other);
++      if (removed) {
++        await db.deleteTransaction({ id: other.id });
++      }
++      if (!removed || other.amount !== expectedAmount) {
++        conflicts.push({
++          accountName: earliest.accountName,
++          date: fromDateRepr(earliest.date),
++          amount: earliest.amount,
++          otherDate: fromDateRepr(other.date),
++          otherAmount: other.amount,
++          expectedAmount,
++          removed,
++        });
++      }
++    }
++  }
++  return conflicts;
++}
+diff --git a/packages/loot-core/src/server/accounts/payees.ts b/packages/loot-core/src/server/accounts/payees.ts
+index ceca05e0d..4c06111ac 100644
+--- a/packages/loot-core/src/server/accounts/payees.ts
++++ b/packages/loot-core/src/server/accounts/payees.ts
+@@ -1,5 +1,7 @@
+ import * as db from '#server/db';
+ 
++import { unusedStableId } from './stable-ids';
++
+ export async function createPayee(description: string) {
+   // Check to make sure no payee already exists with exactly the same
+   // name
+@@ -11,7 +13,11 @@ export async function createPayee(description: string) {
+   if (row) {
+     return row.id;
+   } else {
+-    return (await db.insertPayee({ name: description })) as db.DbPayee['id'];
++    // Two devices creating the same payee before syncing get one payee
++    return (await db.insertPayee({
++      id: await unusedStableId('payees', 'payee', description.toLowerCase()),
++      name: description,
++    })) as db.DbPayee['id'];
+   }
+ }
+ 
+diff --git a/packages/loot-core/src/server/accounts/stable-ids.ts b/packages/loot-core/src/server/accounts/stable-ids.ts
+new file mode 100644
+index 000000000..fd8d55be6
+--- /dev/null
++++ b/packages/loot-core/src/server/accounts/stable-ids.ts
+@@ -0,0 +1,91 @@
++import { v4 as uuidv4, v5 as uuidv5 } from 'uuid';
++
++import * as db from '#server/db';
++
++// Namespace for ids derived from what a row represents (see `stableId`)
++const NAMESPACE = 'b1f3c7d2-5e8a-4c6b-9f0d-2a7e4b8c1d35';
++
++/**
++ * An id derived from what a row represents rather than a random one.
++ *
++ * When two devices import the same bank account or file before syncing with
++ * each other, random ids turn every transaction (and its payee, opening
++ * balance, split lines and transfer) into two rows once they sync. With the
++ * same id on both devices they are the same row, and sync merges the two
++ * writes field by field like any other edit.
++ */
++export function stableId(...parts: Array<string | number | null | undefined>) {
++  return uuidv5(JSON.stringify(parts.map(part => part ?? null)), NAMESPACE);
++}
++
++/**
++ * `stableId`, unless a row with that id already exists in `table` (for
++ * example one that was deleted or merged away): then a random id, so an old
++ * row is never brought back or written over.
++ */
++export async function unusedStableId(
++  table: 'transactions' | 'payees',
++  ...parts: Array<string | number | null | undefined>
++): Promise<string> {
++  const id = stableId(...parts);
++  const existing = await db.first<{ id: string }>(
++    `SELECT id FROM ${table} WHERE id = ?`,
++    [id],
++  );
++  return existing ? uuidv4() : id;
++}
++
++type ImportedTransaction = {
++  imported_id?: string | null;
++  date?: string | null;
++  amount?: number | null;
++  imported_payee?: string | null;
++  notes?: string | null;
++};
++
++/**
++ * Ids for transactions about to be created from imported data (bank sync or
++ * a file), in import order.
++ *
++ * A bank id identifies the transaction on its own. Without one (CSV, QIF)
++ * the date, amount, bank payee and notes do, counting repeats within the
++ * import so that two identical transactions on the same day stay two.
++ */
++export async function importedTransactionIds(
++  accountId: string,
++  transactions: ImportedTransaction[],
++): Promise<string[]> {
++  const seen = new Map<string, number>();
++  const ids: string[] = [];
++  for (const trans of transactions) {
++    if (trans.imported_id) {
++      ids.push(
++        await unusedStableId(
++          'transactions',
++          'imported',
++          accountId,
++          trans.imported_id,
++        ),
++      );
++      continue;
++    }
++    const content = JSON.stringify([
++      trans.date,
++      trans.amount,
++      trans.imported_payee,
++      trans.notes,
++    ]);
++    const occurrence = seen.get(content) ?? 0;
++    seen.set(content, occurrence + 1);
++    ids.push(
++      await unusedStableId(
++        'transactions',
++        'imported-content',
++        accountId,
++        content,
++        occurrence,
++      ),
++    );
++  }
++  return ids;
++}
+diff --git a/packages/loot-core/src/server/accounts/sync.test.ts b/packages/loot-core/src/server/accounts/sync.test.ts
+index e3b7e3a36..5f5eddd3a 100644
+--- a/packages/loot-core/src/server/accounts/sync.test.ts
++++ b/packages/loot-core/src/server/accounts/sync.test.ts
+@@ -1,4 +1,6 @@
+ // @ts-strict-ignore
++import { v4 as uuidv4 } from 'uuid';
++
+ import * as asyncStorage from '#platform/server/asyncStorage';
+ import * as db from '#server/db';
+ import { loadMappings } from '#server/db/mappings';
+@@ -363,6 +365,97 @@ describe('Account sync', () => {
+     expect(transactions2.length).toBe(1);
+   });
+ 
++  describe('a pending transaction that was deleted', () => {
++    const bankTransaction = (
++      transactionId: string,
++      date: string,
++      booked: boolean,
++    ) => ({
++      transactionId,
++      date,
++      booked,
++      payeeName: 'UBER TRIP',
++      transactionAmount: { amount: '-8.99', currency: 'GBP' },
++    });
++    const bankSync = (acctId: string, transactions, reimportDeleted) =>
++      reconcileTransactions(acctId, transactions, {
++        isBankSyncAccount: true,
++        strictIdChecking: false,
++        reimportDeleted,
++      });
++    const alive = async () =>
++      (await getAllTransactions()).filter(t => t.tombstone === 0);
++
++    test('stays deleted when the bank books it under a new id, with re-importing deleted transactions off', async () => {
++      const { id: acctId } = await prepareDatabase();
++      await bankSync(
++        acctId,
++        [bankTransaction('pending-1', '2020-01-01', false)],
++        false,
++      );
++      const [pending] = await alive();
++      await db.deleteTransaction(pending);
++
++      await bankSync(
++        acctId,
++        [bankTransaction('booked-1', '2020-01-03', true)],
++        false,
++      );
++      expect(await alive()).toEqual([]);
++      // It now carries the booked id, so later syncs match it by id
++      expect(
++        (await getAllTransactions()).find(t => t.id === pending.id)
++          ?.imported_id,
++      ).toBe('booked-1');
++
++      await bankSync(
++        acctId,
++        [bankTransaction('booked-1', '2020-01-03', true)],
++        false,
++      );
++      expect(await alive()).toEqual([]);
++    });
++
++    test('is imported again when it books, with re-importing deleted transactions on', async () => {
++      const { id: acctId } = await prepareDatabase();
++      await bankSync(
++        acctId,
++        [bankTransaction('pending-1', '2020-01-01', false)],
++        true,
++      );
++      const [pending] = await alive();
++      await db.deleteTransaction(pending);
++
++      await bankSync(
++        acctId,
++        [bankTransaction('booked-1', '2020-01-03', true)],
++        true,
++      );
++      expect((await alive()).map(t => t.imported_id)).toEqual(['booked-1']);
++    });
++
++    test('a deleted booked transaction does not hide a new one of the same amount', async () => {
++      const { id: acctId } = await prepareDatabase();
++      await bankSync(
++        acctId,
++        [bankTransaction('booked-1', '2020-01-01', true)],
++        false,
++      );
++      const [booked] = await alive();
++      await db.deleteTransaction(booked);
++
++      await bankSync(
++        acctId,
++        [
++          bankTransaction('booked-1', '2020-01-01', true),
++          bankTransaction('booked-2', '2020-01-03', true),
++        ],
++        false,
++      );
++      expect((await alive()).map(t => t.imported_id)).toEqual(['booked-2']);
++    });
++  });
++
+   test('reconcile run rules with inferred payee', async () => {
+     const { id: acctId } = await prepareDatabase();
+     await db.insertCategoryGroup({
+@@ -887,6 +980,62 @@ describe('Account sync', () => {
+     ).toBe('child-provider-id');
+   });
+ 
++  test('bank sync updating dates keeps a matched split line with its split', async () => {
++    const { id } = await prepareDatabase();
++
++    await db.insertTransaction({
++      id: 'split-parent',
++      account: id,
++      amount: -1000,
++      date: '2024-03-31',
++      is_parent: true,
++    });
++    await db.insertTransaction({
++      id: 'split-child-1',
++      account: id,
++      amount: -299,
++      date: '2024-03-31',
++      is_child: true,
++      parent_id: 'split-parent',
++    });
++    await db.insertTransaction({
++      id: 'split-child-2',
++      account: id,
++      amount: -701,
++      date: '2024-03-31',
++      is_child: true,
++      parent_id: 'split-parent',
++    });
++
++    // The bank reports the matched line two days later, in the next month
++    await reconcileTransactions(
++      id,
++      [
++        {
++          transactionId: 'child-provider-id',
++          transactionAmount: { amount: '-2.99' },
++          date: '2024-04-02',
++          payeeName: 'Child merchant',
++          booked: true,
++        },
++      ],
++      { isBankSyncAccount: true, strictIdChecking: false, updateDates: true },
++    );
++
++    const transactions = await getAllTransactions();
++    const dates = Object.fromEntries(
++      transactions
++        .filter(transaction => transaction.id.startsWith('split-'))
++        .map(transaction => [transaction.id, transaction.date]),
++    );
++    // The line stays in March with the rest of its split
++    expect(dates).toEqual({
++      'split-parent': 20240331,
++      'split-child-1': 20240331,
++      'split-child-2': 20240331,
++    });
++  });
++
+   test(
+     'given an imported tx with no imported_id, ' +
+       'when using fuzzy search V2, existing transaction has an imported_id, matches amount, and is within 7 days of imported tx, ' +
+@@ -988,6 +1137,88 @@ describe('Account sync', () => {
+   );
+ });
+ 
++describe('Importing the same data on two devices', () => {
++  // Each device starts from the same synced budget and imports on its own;
++  // emptying the database between runs stands in for the second device
++  async function importOnFreshDevice(
++    transactions: Parameters<typeof reconcileTransactions>[1],
++    otherDevice = false,
++  ) {
++    await global.emptyDatabase()();
++    await loadMappings();
++    await loadRules();
++    if (otherDevice) {
++      // Random ids differ between devices; the test ids are a counter
++      for (let i = 0; i < 50; i++) {
++        uuidv4();
++      }
++    }
++    await db.insertAccount({ id: 'joint', name: 'Joint' });
++    await insertRule({
++      stage: null,
++      conditionsOp: 'and',
++      conditions: [{ op: 'contains', field: 'imported_payee', value: 'tesco' }],
++      actions: [
++        {
++          op: 'set-split-amount',
++          value: 1000,
++          options: { splitIndex: 1, method: 'fixed-amount' },
++        },
++        {
++          op: 'set-split-amount',
++          value: null,
++          options: { splitIndex: 2, method: 'remainder' },
++        },
++      ],
++    });
++    await reconcileTransactions('joint', transactions);
++    return {
++      transactions: await db.all<{
++        id: string;
++        parent_id: string | null;
++        amount: number;
++        payee: string;
++      }>(
++        'SELECT id, parent_id, amount, payee FROM v_transactions_internal WHERE tombstone = 0 ORDER BY id',
++      ),
++      payees: await db.all<{ id: string; name: string }>(
++        'SELECT id, name FROM payees WHERE tombstone = 0 AND transfer_acct IS NULL ORDER BY id',
++      ),
++    };
++  }
++
++  test('creates the same transactions, split lines and payees on both devices', async () => {
++    const data = [
++      {
++        date: '2026-11-02',
++        amount: -2500,
++        imported_payee: 'TESCO',
++        payee_name: 'Tesco',
++        imported_id: 'bank-1',
++      },
++      {
++        date: '2026-11-03',
++        amount: -999,
++        imported_payee: 'CAFE',
++        payee_name: 'Cafe',
++      },
++      {
++        date: '2026-11-03',
++        amount: -999,
++        imported_payee: 'CAFE',
++        payee_name: 'Cafe',
++      },
++    ];
++    const first = await importOnFreshDevice(data);
++    const second = await importOnFreshDevice(data, true);
++
++    // One split (parent + 2 lines) and two separate identical coffees
++    expect(first.transactions).toHaveLength(5);
++    expect(new Set(first.transactions.map(t => t.id)).size).toBe(5);
++    expect(second).toEqual(first);
++  });
++});
++
+ describe('SimpleFin batch sync', () => {
+   let previousGoCardlessTransactionsHandler;
+ 
+@@ -1424,6 +1655,39 @@ describe('Enable Banking sync', () => {
+     },
+   );
+ 
++  test('dates the opening balance at the oldest transaction when the bank returns them oldest-first', async () => {
++    const acctId = await prepareEnableBankingAccount();
++
++    const makeTransaction = (id: string, date: string, amount: string) => ({
++      transactionId: id,
++      date,
++      payeeName: 'Shop ' + id,
++      transactionAmount: { amount, currency: 'EUR' },
++      booked: true,
++    });
++    const transactions = [
++      makeTransaction('eb-tx-1', '2017-08-01', '-10.00'),
++      makeTransaction('eb-tx-2', '2017-09-01', '-20.00'),
++      makeTransaction('eb-tx-3', '2017-10-01', '-30.00'),
++    ];
++    handlers['/enablebanking/transactions'] = () => ({
++      transactions: { all: transactions, booked: transactions, pending: [] },
++      balances: [],
++      startingBalance: 10000,
++    });
++
++    const result = await accountsApp.handlers['accounts-bank-sync']({
++      ids: [acctId],
++    });
++    expect(result.errors).toHaveLength(0);
++
++    const openingBalance = (await getAllTransactions()).find(
++      t => t.starting_balance_flag,
++    );
++    expect(openingBalance?.amount).toBe(16000);
++    expect(openingBalance?.date).toBe(20170801);
++  });
++
+   test.each([
+     ['is off', 'false', false],
+     ['is not set', undefined, true],
+diff --git a/packages/loot-core/src/server/accounts/sync.ts b/packages/loot-core/src/server/accounts/sync.ts
+index 691420ad7..505da17ec 100644
+--- a/packages/loot-core/src/server/accounts/sync.ts
++++ b/packages/loot-core/src/server/accounts/sync.ts
+@@ -35,7 +35,9 @@ import type {
+   TransactionEntity,
+ } from '#types/models';
+ 
++import { openingBalanceIdParts } from './opening-balances';
+ import { getStartingBalancePayee } from './payees';
++import { importedTransactionIds, stableId, unusedStableId } from './stable-ids';
+ import { title } from './title';
+ 
+ function BankSyncError(type: string, code: string, details?: object) {
+@@ -50,6 +52,9 @@ function makeSplitTransaction(trans, subtransactions) {
+     subtransactions: subtransactions.map((transaction, idx) =>
+       makeChildTransaction(trans, {
+         ...transaction,
++        // Derived from the parent, so a split imported on two devices has
++        // the same lines on both (rules give new lines random ids)
++        id: stableId('line', trans.id, idx),
+         sort_order: 0 - idx,
+       }),
+     ),
+@@ -419,8 +424,12 @@ async function resolvePayee(trans, payeeName, payeesToCreate) {
+     if (payee != null) {
+       return payee.id;
+     } else {
+-      // Otherwise we're going to create a new one
+-      const newPayee = { id: uuidv4(), name: payeeName };
++      // Otherwise we're going to create a new one, with the same id another
++      // device importing the same data would use
++      const newPayee = {
++        id: await unusedStableId('payees', 'payee', payeeName.toLowerCase()),
++        name: payeeName,
++      };
+       payeesToCreate.set(payeeName.toLowerCase(), newPayee);
+       return newPayee.id;
+     }
+@@ -661,6 +670,7 @@ export async function reconcileTransactions(
+ 
+   const updated = [];
+   const added = [];
++  const toInsert = [];
+   const updatedPreview = [];
+   const existingPayeeMap = new Map<string, string>();
+ 
+@@ -771,21 +781,32 @@ export async function reconcileTransactions(
+     } else {
+       // Insert a new transaction
+       const { forceAddTransaction: _forceAddTransaction, ...newTrans } = trans;
+-      const finalTransaction = {
+-        ...newTrans,
+-        id: uuidv4(),
+-        category: trans.category || null,
+-        cleared: trans.cleared ?? defaultCleared,
+-      };
+-
+-      if (subtransactions && subtransactions.length > 0) {
+-        added.push(...makeSplitTransaction(finalTransaction, subtransactions));
+-      } else {
+-        added.push(finalTransaction);
+-      }
++      toInsert.push({
++        finalTransaction: {
++          ...newTrans,
++          category: trans.category || null,
++          cleared: trans.cleared ?? defaultCleared,
++        },
++        subtransactions,
++      });
+     }
+   }
+ 
++  // The same imported transaction gets the same id on every device, so
++  // importing it on two devices before they sync does not duplicate it
++  const insertIds = await importedTransactionIds(
++    acctId,
++    toInsert.map(({ finalTransaction }) => finalTransaction),
++  );
++  toInsert.forEach(({ finalTransaction, subtransactions }, index) => {
++    const withId = { ...finalTransaction, id: insertIds[index] };
++    if (subtransactions && subtransactions.length > 0) {
++      added.push(...makeSplitTransaction(withId, subtransactions));
++    } else {
++      added.push(withId);
++    }
++  });
++
+   // Maintain the sort order of the server
+   const now = Date.now();
+   added.forEach((t, index) => {
+@@ -885,6 +906,7 @@ export async function matchTransactions(
+ 
+     let match = null;
+     let fuzzyDataset = null;
++    let deletedPendingDataset = null;
+ 
+     // First, match with an existing transaction's imported_id. This
+     // is the highest fidelity match and should always be attempted
+@@ -982,6 +1004,15 @@ export async function matchTransactions(
+       fuzzyDataset = fuzzyDataset.sort((a, b) =>
+         compareFuzzyMatchCandidates(trans.date, a, b),
+       );
++
++      if (isBankSyncAccount && !reimportDeleted) {
++        deletedPendingDataset = await getDeletedPendingCandidates(
++          acctId,
++          trans,
++          sevenDaysBefore,
++          sevenDaysAfter,
++        );
++      }
+     }
+ 
+     transactionsStep1.push({
+@@ -990,6 +1021,7 @@ export async function matchTransactions(
+       subtransactions: trans.subtransactions || subtransactions,
+       match,
+       fuzzyDataset,
++      deletedPendingDataset,
+     });
+   }
+ 
+@@ -1020,19 +1052,41 @@ export async function matchTransactions(
+   // matching: it just find the first transaction that hasn't been
+   // matched yet. Remember the dataset only contains transactions
+   // around the same date with the same amount.
+-  const transactionsStep3 = transactionsStep2.map(data => {
+-    if (!data.match && data.fuzzyDataset) {
+-      const match = data.fuzzyDataset.find(
+-        row =>
+-          !hasMatched.has(row.id) && !exactMatchedParentIds.has(row.parent_id),
+-      );
+-      if (match) {
+-        hasMatched.add(match.id);
+-        return { ...data, match };
++  const transactionsStep3 = transactionsStep2
++    .map(data => {
++      if (!data.match && data.fuzzyDataset) {
++        const match = data.fuzzyDataset.find(
++          row =>
++            !hasMatched.has(row.id) &&
++            !exactMatchedParentIds.has(row.parent_id),
++        );
++        if (match) {
++          hasMatched.add(match.id);
++          return { ...data, match };
++        }
+       }
+-    }
+-    return data;
+-  });
++      return data;
++    })
++    .map(data => {
++      // With re-importing deleted transactions turned off, a pending
++      // transaction that was deleted stays deleted when the bank books it,
++      // even though the bank gives the booked transaction a new id. This is
++      // the same match a pending transaction that was not deleted gets
++      // above, and the deleted one takes the booked id so later syncs match
++      // it by id.
++      if (!data.match && data.deletedPendingDataset) {
++        const unmatched = data.deletedPendingDataset.filter(
++          row => !hasMatched.has(row.id),
++        );
++        const match =
++          unmatched.find(row => data.trans.payee === row.payee) ?? unmatched[0];
++        if (match) {
++          hasMatched.add(match.id);
++          return { ...data, match };
++        }
++      }
++      return data;
++    });
+ 
+   return {
+     payeesToCreate,
+@@ -1042,6 +1096,39 @@ export async function matchTransactions(
+   };
+ }
+ 
++/**
++ * Deleted transactions that were pending when bank sync imported them, with
++ * the same amount and within the same days as `trans`: candidates for being
++ * the pending version of it.
++ */
++async function getDeletedPendingCandidates(
++  acctId: string,
++  trans: { date: string; amount?: number },
++  fromDate: number,
++  toDate: number,
++) {
++  const rows = await db.all<
++    db.DbViewTransactionInternal & { raw_synced_data: string | null }
++  >(
++    `SELECT * FROM v_transactions_internal
++      WHERE tombstone = 1 AND is_child = 0
++        AND date >= ? AND date <= ? AND amount = ? AND account = ?
++        AND raw_synced_data IS NOT NULL`,
++    [fromDate, toDate, trans.amount || 0, acctId],
++  );
++  return rows
++    .filter(row => wasPendingWhenImported(row.raw_synced_data))
++    .sort((a, b) => compareFuzzyMatchCandidates(trans.date, a, b));
++}
++
++function wasPendingWhenImported(rawSyncedData: string | null) {
++  try {
++    return JSON.parse(rawSyncedData ?? 'null')?.booked === false;
++  } catch {
++    return false;
++  }
++}
++
+ // This is similar to `reconcileTransactions` except much simpler: it
+ // does not try to match any transactions. It just adds them
+ export async function addTransactions(
+@@ -1065,7 +1152,14 @@ export async function addTransactions(
+     const trans = await runRules(originalTrans, accountsMap);
+ 
+     const finalTransaction = {
+-      id: uuidv4(),
++      id: trans.imported_id
++        ? await unusedStableId(
++            'transactions',
++            'imported',
++            acctId,
++            trans.imported_id,
++          )
++        : uuidv4(),
+       ...trans,
+       account: acctId,
+       cleared: trans.cleared != null ? trans.cleared : true,
+@@ -1183,14 +1277,23 @@ async function processBankSyncDownload(
+       balanceToUse = Math.round(previousBalance);
+     }
+ 
+-    const oldestTransaction = transactions[transactions.length - 1];
++    // Not every provider returns transactions newest-first (Enable Banking
++    // passes the bank's own order through), so find the earliest date
++    // rather than assuming it is the last element.
++    const oldestDate = transactions.reduce(
++      (oldest: string | null, trans) =>
++        trans.date && (oldest === null || trans.date < oldest)
++          ? trans.date
++          : oldest,
++      null,
++    );
+ 
+     // Use custom starting date if provided, otherwise use oldest transaction date or current day
+     let startingBalanceDate: string;
+     if (customStartingDate) {
+       startingBalanceDate = customStartingDate;
+-    } else if (transactions.length > 0) {
+-      startingBalanceDate = oldestTransaction.date;
++    } else if (oldestDate) {
++      startingBalanceDate = oldestDate;
+     } else {
+       startingBalanceDate = monthUtils.currentDay();
+     }
+@@ -1204,6 +1307,14 @@ async function processBankSyncDownload(
+         balanceToUse === null
+           ? null
+           : await db.insertTransaction({
++              // Both devices linking the same account before syncing must
++              // not each add an opening balance. The same figure becomes one
++              // transaction; different figures (linked on different days)
++              // stay whole, for `resolveOpeningBalances` to sort out.
++              id: await unusedStableId(
++                'transactions',
++                ...openingBalanceIdParts(id, startingBalanceDate, balanceToUse),
++              ),
+               account: id,
+               amount: balanceToUse,
+               category: acctRow.offbudget === 0 ? payee.category : null,
+diff --git a/packages/loot-core/src/server/aql/compiler.ts b/packages/loot-core/src/server/aql/compiler.ts
+index b44af9f6d..41a465fb6 100644
+--- a/packages/loot-core/src/server/aql/compiler.ts
++++ b/packages/loot-core/src/server/aql/compiler.ts
+@@ -738,6 +738,10 @@ const compileOp = saveStack('op', (state, fieldRef, opData) => {
+       const [left, right] = valArray(state, [lhs, rhs], ['string', 'string']);
+       return `REGEXP(${right}, ${left})`;
+     }
++    case '$regexpnocase': {
++      const [left, right] = valArray(state, [lhs, rhs], ['string', 'string']);
++      return `REGEXP_NOCASE(${right}, ${left})`;
++    }
+     case '$notregexp': {
+       const [left, right] = valArray(state, [lhs, rhs], ['string', 'string']);
+       return `(NOT REGEXP(${right}, ${left}) OR ${left} IS NULL)`;
+diff --git a/packages/loot-core/src/server/budget/actions.test.ts b/packages/loot-core/src/server/budget/actions.test.ts
+index 4a22fb548..72c0ad38a 100644
+--- a/packages/loot-core/src/server/budget/actions.test.ts
++++ b/packages/loot-core/src/server/budget/actions.test.ts
+@@ -9,7 +9,9 @@ import {
+   coverOverbudgeted,
+   getCategoryWeeklyAverage,
+   getSheetValue,
++  set12MonthAvg,
+   set3MonthAvg,
++  set6MonthAvg,
+   setBudget,
+   setCategoryCarryover,
+   setNMonthAvg,
+@@ -194,6 +196,24 @@ describe('set budget average', () => {
+ 
+     expect(await getSheetValue('budget202404', 'budget-cat1')).toBe(600);
+   });
++
++  it.each([
++    ['6', set6MonthAvg],
++    ['12', set12MonthAvg],
++  ])(
++    'saves the bulk %s month average before resolving',
++    async (_n, setAverage) => {
++      await setAverage({ month: '2024-04' });
++
++      // No waiting: the budget must already be saved when the action
++      // resolves, so it is part of the same undo step and sync batch.
++      const row = await db.first<{ amount: number }>(
++        'SELECT amount FROM zero_budgets WHERE month = ? AND category = ?',
++        [202404, 'cat1'],
++      );
++      expect(row).not.toBeNull();
++    },
++  );
+ });
+ 
+ describe('getCategoryWeeklyAverage', () => {
+diff --git a/packages/loot-core/src/server/budget/actions.ts b/packages/loot-core/src/server/budget/actions.ts
+index 3cecc793b..d447eebe7 100644
+--- a/packages/loot-core/src/server/budget/actions.ts
++++ b/packages/loot-core/src/server/budget/actions.ts
+@@ -23,6 +23,14 @@ export async function getSheetValue(
+   return safeNumber(typeof node.value === 'number' ? node.value : 0);
+ }
+ 
++// `getSheetValue` reads an unset cell as 0; use this to tell the two apart.
++export async function hasSheetValue(
++  sheetName: string,
++  cell: string,
++): Promise<boolean> {
++  return sheet.getCell(sheetName, cell).value != null;
++}
++
+ export async function getSheetBoolean(
+   sheetName: string,
+   cell: string,
+@@ -331,7 +339,7 @@ export async function set12MonthAvg({
+       if (cat.is_income === 1 && !isTrackingBudget()) {
+         continue;
+       }
+-      void setNMonthAvg({ month, N: 12, category: cat.id });
++      await setNMonthAvg({ month, N: 12, category: cat.id });
+     }
+   });
+ }
+@@ -355,7 +363,7 @@ export async function set6MonthAvg({
+       if (cat.is_income === 1 && !isTrackingBudget()) {
+         continue;
+       }
+-      void setNMonthAvg({ month, N: 6, category: cat.id });
++      await setNMonthAvg({ month, N: 6, category: cat.id });
+     }
+   });
+ }
+diff --git a/packages/loot-core/src/server/budget/goal-template.test.ts b/packages/loot-core/src/server/budget/goal-template.test.ts
+index f8e642717..7b17ae438 100644
+--- a/packages/loot-core/src/server/budget/goal-template.test.ts
++++ b/packages/loot-core/src/server/budget/goal-template.test.ts
+@@ -20,6 +20,7 @@ import * as statements from './statements';
+ vi.mock('./actions', () => ({
+   getSheetValue: vi.fn(),
+   getSheetBoolean: vi.fn(),
++  hasSheetValue: vi.fn(),
+   isTrackingBudget: vi.fn(),
+   setBudget: vi.fn(),
+   setGoal: vi.fn(),
+@@ -66,6 +67,9 @@ function setupSheetMock(values: Record<string, number>) {
+   vi.mocked(actions.getSheetValue).mockImplementation(
+     async (_sheet: string, key: string) => values[key] ?? 0,
+   );
++  vi.mocked(actions.hasSheetValue).mockImplementation(
++    async (_sheet: string, key: string) => values[key] != null,
++  );
+   vi.mocked(actions.getSheetBoolean).mockResolvedValue(false);
+   vi.mocked(actions.isTrackingBudget).mockReturnValue(false);
+ }
+@@ -725,6 +729,21 @@ describe('applyMultipleCategoryTemplates', () => {
+     );
+   });
+ 
++  it('leaves categories without templates or a goal untouched', async () => {
++    setupSheetMock({
++      'to-budget': 0,
++      'budget-cat-1': 5000,
++    });
++    setupAqlMultiCategory([cat1], {});
++
++    await applyMultipleCategoryTemplates({
++      month: '2024-01',
++      categoryIds: [cat1.id],
++    });
++
++    expect(actions.setGoal).not.toHaveBeenCalled();
++  });
++
+   it('distributes remainder funds across categories by weight', async () => {
+     // Weights 3 and 1; $200 split 75% / 25%.
+     setupSheetMock({ 'to-budget': 20000 });
+diff --git a/packages/loot-core/src/server/budget/goal-template.ts b/packages/loot-core/src/server/budget/goal-template.ts
+index cab620943..2c14b5aa9 100644
+--- a/packages/loot-core/src/server/budget/goal-template.ts
++++ b/packages/loot-core/src/server/budget/goal-template.ts
+@@ -10,7 +10,13 @@ import type { CategoryEntity, CategoryGroupEntity } from '#types/models';
+ import type { CleanupTemplate } from '#types/models/cleanup-templates';
+ import type { Template } from '#types/models/templates';
+ 
+-import { getSheetValue, isTrackingBudget, setBudget, setGoal } from './actions';
++import {
++  getSheetValue,
++  hasSheetValue,
++  isTrackingBudget,
++  setBudget,
++  setGoal,
++} from './actions';
+ import { CategoryTemplateContext } from './category-template-context';
+ import { tombstoneOrphanCleanupGroups } from './cleanup-groups';
+ import { checkTemplateNotes, storeNoteTemplates } from './template-notes';
+@@ -272,7 +278,9 @@ async function computeTemplates(
+     const sheetName = monthUtils.sheetForMonth(month);
+     const templates = categoryTemplates[id];
+     const budgeted = await getSheetValue(sheetName, `budget-${id}`);
+-    const existingGoal = await getSheetValue(sheetName, `goal-${id}`);
++    // Not `getSheetValue`: it reads an unset goal as 0, which would make
++    // every category without templates look like it has a goal to clear.
++    const hasExistingGoal = await hasSheetValue(sheetName, `goal-${id}`);
+ 
+     // only run categories that are unbudgeted or if we are forcing it
+     if ((budgeted === 0 || force) && templates) {
+@@ -294,7 +302,7 @@ async function computeTemplates(
+             );
+           });
+         if (templateContext.hasOnlyExpiredTemplates()) {
+-          if (existingGoal !== null) {
++          if (hasExistingGoal) {
+             orphanGoals.push({ category: id, goal: null, longGoal: null });
+           }
+           continue;
+@@ -311,7 +319,7 @@ async function computeTemplates(
+       }
+ 
+       // do a reset of the goals that are orphaned
+-    } else if (existingGoal !== null && !templates) {
++    } else if (hasExistingGoal && !templates) {
+       orphanGoals.push({
+         category: id,
+         goal: null,
+diff --git a/packages/loot-core/src/server/rules/condition.ts b/packages/loot-core/src/server/rules/condition.ts
+index 40ae0dbcb..2ff4057af 100644
+--- a/packages/loot-core/src/server/rules/condition.ts
++++ b/packages/loot-core/src/server/rules/condition.ts
+@@ -17,7 +17,7 @@ import {
+   isValidOp,
+   sortNumbers,
+ } from '#shared/rules';
+-import { extractTagsForFilter } from '#shared/tags';
++import { extractTagsForFilter, makeTagAqlRegex } from '#shared/tags';
+ 
+ import {
+   assert,
+@@ -147,7 +147,10 @@ export const CONDITION_TYPES = {
+         );
+       }
+ 
+-      if (op === 'hasTags' || op === 'hasAnyTag') {
++      // Regex patterns are kept as typed and matched case-insensitively
++      // (see `eval`). Lowercasing them would flip escapes such as `\D`,
++      // `\S`, `\W` and `\B` into `\d`, `\s`, `\w` and `\b`.
++      if (op === 'hasTags' || op === 'hasAnyTag' || op === 'matches') {
+         return value;
+       }
+ 
+@@ -261,6 +264,7 @@ export class Condition {
+       return false;
+     }
+ 
++    const originalFieldValue = fieldValue;
+     if (typeof fieldValue === 'string') {
+       fieldValue = fieldValue.toLowerCase();
+     }
+@@ -359,33 +363,24 @@ export class Condition {
+         }
+         return this.value.indexOf(fieldValue) !== -1;
+ 
++      // Same patterns as the query side (`makeTagAqlRegex`), and case
++      // sensitive like tags everywhere else, so a rule applies to exactly
++      // the transactions its preview and the tag filters show
+       case 'hasTags':
++      case 'hasAnyTag': {
+         if (fieldValue === null) {
+           return false;
+         }
+-        const normalizedFieldValue = String(fieldValue);
+-        const tags = extractTagsForFilter(this.value);
+-        return !tags.some(tag => {
+-          const escapedTag = tag
+-            .toLowerCase()
+-            .replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+-          const pattern = new RegExp(`(?<!#)${escapedTag}([\\s#]|$)`);
+-          return !pattern.test(normalizedFieldValue);
+-        });
+-
+-      case 'hasAnyTag': {
+-        if (fieldValue === null) {
++        const notes = String(originalFieldValue);
++        const patterns = extractTagsForFilter(this.value).map(
++          tag => new RegExp(makeTagAqlRegex(tag)),
++        );
++        if (patterns.length === 0) {
+           return false;
+         }
+-        const normalizedFieldValue = String(fieldValue);
+-        const tags = extractTagsForFilter(this.value);
+-        return tags.some(tag => {
+-          const escapedTag = tag
+-            .toLowerCase()
+-            .replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+-          const pattern = new RegExp(`(?<!#)${escapedTag}([\\s#]|$)`);
+-          return pattern.test(normalizedFieldValue);
+-        });
++        return this.op === 'hasTags'
++          ? patterns.every(pattern => pattern.test(notes))
++          : patterns.some(pattern => pattern.test(notes));
+       }
+ 
+       case 'notOneOf':
+@@ -434,7 +429,7 @@ export class Condition {
+           return false;
+         }
+         try {
+-          return new RegExp(this.value).test(fieldValue);
++          return new RegExp(this.value, 'i').test(originalFieldValue);
+         } catch (e) {
+           logger.log('invalid regexp in matches condition', e);
+           return false;
+diff --git a/packages/loot-core/src/server/rules/index.test.ts b/packages/loot-core/src/server/rules/index.test.ts
+index 025ae13f5..7126a2d5d 100644
+--- a/packages/loot-core/src/server/rules/index.test.ts
++++ b/packages/loot-core/src/server/rules/index.test.ts
+@@ -309,6 +309,29 @@ describe('Condition', () => {
+     expect(cond.eval({ notes: 'f o o' })).toBe(false);
+   });
+ 
++  test('matches keeps uppercase regex escapes and stays case-insensitive', () => {
++    // `\D` must not become `\d`: only names with no digits match
++    let cond = new Condition('matches', 'notes', '^\\D+$', null);
++    expect(cond.eval({ notes: 'ABC' })).toBe(true);
++    expect(cond.eval({ notes: 'abc' })).toBe(true);
++    expect(cond.eval({ notes: '123' })).toBe(false);
++
++    cond = new Condition('matches', 'notes', '^\\S+$', null);
++    expect(cond.eval({ notes: 'Rent' })).toBe(true);
++    expect(cond.eval({ notes: 'Rent March' })).toBe(false);
++
++    cond = new Condition('matches', 'notes', 'CAT\\B', null);
++    expect(cond.eval({ notes: 'catalog' })).toBe(true);
++    expect(cond.eval({ notes: 'cat food' })).toBe(false);
++
++    cond = new Condition('matches', 'imported_payee', '^AMAZON\\W', null);
++    expect(cond.eval({ imported_payee: 'amazon.com' })).toBe(true);
++    expect(cond.eval({ imported_payee: 'Amazonia' })).toBe(false);
++
++    // The pattern is stored as typed
++    expect(cond.serialize().value).toBe('^AMAZON\\W');
++  });
++
+   test('matches handles invalid regex', () => {
+     const cond = new Condition('matches', 'notes', 'fo**', null);
+     expect(cond.eval({ notes: 'foo' })).toBe(false);
+@@ -1230,6 +1253,32 @@ describe('RuleIndexer', () => {
+     );
+   });
+ 
++  test('isNot and notOneOf rules are indexed for every other value', () => {
++    const indexer = new RuleIndexer({ field: 'payee' });
++
++    const isNotRule = new Rule({
++      conditionsOp: 'and',
++      conditions: [{ op: 'isNot', field: 'payee', value: 'p1' }],
++      actions: [{ op: 'set', field: 'notes', value: 'Sarah' }],
++    });
++    indexer.index(isNotRule);
++
++    const notOneOfRule = new Rule({
++      conditionsOp: 'and',
++      conditions: [{ op: 'notOneOf', field: 'payee', value: ['p1', 'p3'] }],
++      actions: [{ op: 'set', field: 'notes', value: 'Sarah' }],
++    });
++    indexer.index(notOneOfRule);
++
++    expect(indexer.getApplicableRules({ payee: 'p2' })).toEqual(
++      new Set([isNotRule, notOneOfRule]),
++    );
++
++    indexer.remove(isNotRule);
++    indexer.remove(notOneOfRule);
++    expect(indexer.getApplicableRules({ payee: 'p2' }).size).toBe(0);
++  });
++
+   test('re-indexing a field works', () => {
+     const indexer = new RuleIndexer({ field: 'category', method: 'firstchar' });
+ 
+diff --git a/packages/loot-core/src/server/rules/rule-indexer.ts b/packages/loot-core/src/server/rules/rule-indexer.ts
+index dd3fc0a63..ed01ffc55 100644
+--- a/packages/loot-core/src/server/rules/rule-indexer.ts
++++ b/packages/loot-core/src/server/rules/rule-indexer.ts
+@@ -39,14 +39,12 @@ export class RuleIndexer {
+     const cond = rule.conditions.find(cond => cond.field === this.field);
+     const indexes = [];
+ 
+-    if (
+-      cond &&
+-      (cond.op === 'oneOf' ||
+-        cond.op === 'is' ||
+-        cond.op === 'isNot' ||
+-        cond.op === 'notOneOf')
+-    ) {
+-      if (cond.op === 'oneOf' || cond.op === 'notOneOf') {
++    // Only positive matches can be keyed by value. A rule that excludes a
++    // value (`isNot`/`notOneOf`) applies to every *other* value, so it has
++    // to live in the catch-all index or it would only ever be looked up for
++    // the one value it excludes.
++    if (cond && (cond.op === 'oneOf' || cond.op === 'is')) {
++      if (cond.op === 'oneOf') {
+         cond.value.forEach(val => indexes.push(this.getIndexForValue(val)));
+       } else {
+         indexes.push(this.getIndexForValue(cond.value));
+diff --git a/packages/loot-core/src/server/schedules/find-schedules.test.ts b/packages/loot-core/src/server/schedules/find-schedules.test.ts
+new file mode 100644
+index 000000000..baafc52f4
+--- /dev/null
++++ b/packages/loot-core/src/server/schedules/find-schedules.test.ts
+@@ -0,0 +1,81 @@
++import MockDate from 'mockdate';
++
++import * as db from '#server/db';
++import { loadMappings } from '#server/db/mappings';
++import { loadRules } from '#server/transactions/transaction-rules';
++
++import { findSchedules } from './find-schedules';
++
++beforeEach(async () => {
++  await global.emptyDatabase()();
++  await loadMappings();
++  await loadRules();
++  // A Wednesday, so a pattern built from today's weekday can't
++  // accidentally match the Monday transactions below.
++  MockDate.set(new Date(2024, 10, 6));
++});
++
++afterEach(() => {
++  MockDate.reset();
++});
++
++async function insertPayments(accountId: string, dates: string[]) {
++  await db.insertAccount({ id: accountId, name: accountId });
++  const payee = await db.insertPayee({ name: 'Payee ' + accountId });
++  for (const date of dates) {
++    await db.insertTransaction({
++      account: accountId,
++      payee,
++      date,
++      amount: -5000,
++    });
++  }
++}
++
++describe('findSchedules', () => {
++  test('finds a schedule on the 1st and 3rd Monday of the month', async () => {
++    await insertPayments('acct1', [
++      '2024-07-01',
++      '2024-07-15',
++      '2024-08-05',
++      '2024-08-19',
++      '2024-09-02',
++      '2024-09-16',
++      '2024-10-07',
++      '2024-10-21',
++    ]);
++
++    const [schedule] = await findSchedules();
++
++    expect(schedule.date).toMatchObject({
++      frequency: 'monthly',
++      patterns: [
++        { type: 'MO', value: 1 },
++        { type: 'MO', value: 3 },
++      ],
++    });
++  });
++
++  test('finds a schedule on the 2nd and 4th Monday of the month', async () => {
++    await insertPayments('acct1', [
++      '2024-07-08',
++      '2024-07-22',
++      '2024-08-12',
++      '2024-08-26',
++      '2024-09-09',
++      '2024-09-23',
++      '2024-10-14',
++      '2024-10-28',
++    ]);
++
++    const [schedule] = await findSchedules();
++
++    expect(schedule.date).toMatchObject({
++      frequency: 'monthly',
++      patterns: [
++        { type: 'MO', value: 2 },
++        { type: 'MO', value: 4 },
++      ],
++    });
++  });
++});
+diff --git a/packages/loot-core/src/server/schedules/find-schedules.ts b/packages/loot-core/src/server/schedules/find-schedules.ts
+index b777f64a5..a7907d8e2 100644
+--- a/packages/loot-core/src/server/schedules/find-schedules.ts
++++ b/packages/loot-core/src/server/schedules/find-schedules.ts
+@@ -203,7 +203,7 @@ async function monthly1stor3rd(startDate, accountId) {
+     d.subWeeks(parseDate(startDate), 8),
+     14,
+     start => {
+-      const day = d.format(new Date(), 'iiii');
++      const day = d.format(start, 'iiii');
+       const dayValue = day.slice(0, 2).toUpperCase();
+ 
+       return {
+@@ -221,10 +221,10 @@ async function monthly1stor3rd(startDate, accountId) {
+ 
+ async function monthly2ndor4th(startDate, accountId) {
+   return schedulesForPattern(
+-    d.subMonths(parseDate(startDate), 8),
++    d.subWeeks(parseDate(startDate), 8),
+     14,
+     start => {
+-      const day = d.format(new Date(), 'iiii');
++      const day = d.format(start, 'iiii');
+       const dayValue = day.slice(0, 2).toUpperCase();
+ 
+       return {
+diff --git a/packages/loot-core/src/server/tools/app.ts b/packages/loot-core/src/server/tools/app.ts
+index 2214df388..acad2f9c0 100644
+--- a/packages/loot-core/src/server/tools/app.ts
++++ b/packages/loot-core/src/server/tools/app.ts
+@@ -2,7 +2,9 @@ import { createApp } from '#server/app';
+ import { aqlQuery } from '#server/aql';
+ import * as db from '#server/db';
+ import { runMutator } from '#server/mutators';
++import { batchMessages } from '#server/sync';
+ import { batchUpdateTransactions } from '#server/transactions';
++import { alignSplitLines } from '#server/transactions/split-lines';
+ // @ts-strict-ignore
+ import { q } from '#shared/query';
+ import type { TransactionEntity } from '#types/models';
+@@ -22,6 +24,7 @@ async function fixSplitTransactions(): Promise<{
+   numTransfersFixed: number;
+   numNonParentErrorsFixed: number;
+   numParentTransactionsWithCategoryFixed: number;
++  numSplitLinesMoved: number;
+   mismatchedSplits: TransactionEntity[];
+ }> {
+   // 1. Check for child transactions that have a blank payee, and set
+@@ -139,8 +142,17 @@ async function fixSplitTransactions(): Promise<{
+     await batchUpdateTransactions({ updated });
+   });
+ 
++  // 8. Put split lines back on their parent's date and account
++  let numSplitLinesMoved = 0;
++  await runMutator(async () => {
++    await batchMessages(async () => {
++      numSplitLinesMoved = (await alignSplitLines()).length;
++    });
++  });
++
+   return {
+     numBlankPayees: blankPayeeRows.length,
++    numSplitLinesMoved,
+     numCleared: clearedRows.length,
+     numDeleted: deletedRows.length,
+     numTransfersFixed: brokenTransfers.length,
+diff --git a/packages/loot-core/src/server/transactions/__snapshots__/transfer.test.ts.snap b/packages/loot-core/src/server/transactions/__snapshots__/transfer.test.ts.snap
+index b45d45698..1e3cf3211 100644
+--- a/packages/loot-core/src/server/transactions/__snapshots__/transfer.test.ts.snap
++++ b/packages/loot-core/src/server/transactions/__snapshots__/transfer.test.ts.snap
+@@ -24,7 +24,7 @@ exports[`Transfer > split transfers are retained on child transactions 1`] = `
+     "sort_order": 123456789,
+     "starting_balance_flag": 0,
+     "tombstone": 0,
+-    "transfer_id": "id6",
++    "transfer_id": "c7228d47-6b4c-5423-aa54-eb4e0a3a21e1",
+   },
+   {
+     "account": "two",
+@@ -33,7 +33,7 @@ exports[`Transfer > split transfers are retained on child transactions 1`] = `
+     "cleared": 0,
+     "date": 20170101,
+     "error": null,
+-    "id": "id6",
++    "id": "c7228d47-6b4c-5423-aa54-eb4e0a3a21e1",
+     "imported_id": null,
+     "imported_payee": null,
+     "is_child": 0,
+@@ -79,7 +79,7 @@ exports[`Transfer > split transfers are retained on child transactions 3`] = `
+ @@ -22,10 +22,58 @@
+       "starting_balance_flag": 0,
+       "tombstone": 0,
+-      "transfer_id": "id6",
++      "transfer_id": "c7228d47-6b4c-5423-aa54-eb4e0a3a21e1",
+     },
+     Object {
+ +     "account": "one",
+@@ -88,7 +88,7 @@ exports[`Transfer > split transfers are retained on child transactions 3`] = `
+ +     "cleared": 1,
+ +     "date": 20170101,
+ +     "error": null,
+-+     "id": "id7",
+++     "id": "id6",
+ +     "imported_id": null,
+ +     "imported_payee": null,
+ +     "is_child": 1,
+@@ -103,7 +103,7 @@ exports[`Transfer > split transfers are retained on child transactions 3`] = `
+ +     "sort_order": 123456789,
+ +     "starting_balance_flag": 0,
+ +     "tombstone": 0,
+-+     "transfer_id": "id8",
+++     "transfer_id": "e9a28a17-e9b1-57fc-b3a9-55003e36d086",
+ +   },
+ +   Object {
+ +     "account": "one",
+@@ -112,7 +112,7 @@ exports[`Transfer > split transfers are retained on child transactions 3`] = `
+ +     "cleared": 0,
+ +     "date": 20170101,
+ +     "error": null,
+-+     "id": "id8",
+++     "id": "e9a28a17-e9b1-57fc-b3a9-55003e36d086",
+ +     "imported_id": null,
+ +     "imported_payee": null,
+ +     "is_child": 0,
+@@ -127,7 +127,7 @@ exports[`Transfer > split transfers are retained on child transactions 3`] = `
+ +     "sort_order": 123456789,
+ +     "starting_balance_flag": 0,
+ +     "tombstone": 0,
+-+     "transfer_id": "id7",
+++     "transfer_id": "id6",
+ +   },
+ +   Object {
+       "account": "two",
+@@ -190,7 +190,7 @@ exports[`Transfer > transfers are properly de-categorized 2`] = `
+       "starting_balance_flag": 0,
+       "tombstone": 0,
+ -     "transfer_id": null,
+-+     "transfer_id": "id7",
+++     "transfer_id": "2b523edf-77b0-5f89-8f49-18d5d43e259b",
+ +   },
+ +   Object {
+ +     "account": "three",
+@@ -199,7 +199,7 @@ exports[`Transfer > transfers are properly de-categorized 2`] = `
+ +     "cleared": 0,
+ +     "date": 20170101,
+ +     "error": null,
+-+     "id": "id7",
+++     "id": "2b523edf-77b0-5f89-8f49-18d5d43e259b",
+ +     "imported_id": null,
+ +     "imported_payee": null,
+ +     "is_child": 0,
+@@ -249,7 +249,7 @@ exports[`Transfer > transfers are properly de-categorized 3`] = `
+       "sort_order": 123456789,
+       "starting_balance_flag": 0,
+       "tombstone": 0,
+-      "transfer_id": "id7",
++      "transfer_id": "2b523edf-77b0-5f89-8f49-18d5d43e259b",
+     },
+     Object {
+ -     "account": "three",
+@@ -322,7 +322,7 @@ exports[`Transfer > transfers are properly inserted/updated/deleted 2`] = `
+ +     "sort_order": 123456789,
+ +     "starting_balance_flag": 0,
+ +     "tombstone": 0,
+-+     "transfer_id": "id8",
+++     "transfer_id": "770a2c11-0f0f-5cca-b576-661b253fb5cc",
+ +   },
+ +   Object {
+ +     "account": "two",
+@@ -331,7 +331,7 @@ exports[`Transfer > transfers are properly inserted/updated/deleted 2`] = `
+ +     "cleared": 0,
+ +     "date": 20170101,
+ +     "error": null,
+-+     "id": "id8",
+++     "id": "770a2c11-0f0f-5cca-b576-661b253fb5cc",
+ +     "imported_id": null,
+ +     "imported_payee": null,
+ +     "is_child": 0,
+@@ -384,7 +384,7 @@ exports[`Transfer > transfers are properly inserted/updated/deleted 3`] = `
+       "starting_balance_flag": 0,
+       "tombstone": 0,
+ -     "transfer_id": null,
+-+     "transfer_id": "id8",
+++     "transfer_id": "770a2c11-0f0f-5cca-b576-661b253fb5cc",
+     },
+     Object {
+       "account": "one",
+@@ -411,7 +411,7 @@ exports[`Transfer > transfers are properly inserted/updated/deleted 3`] = `
+       "sort_order": 123456789,
+       "starting_balance_flag": 0,
+       "tombstone": 0,
+--     "transfer_id": "id8",
++-     "transfer_id": "770a2c11-0f0f-5cca-b576-661b253fb5cc",
+ +     "transfer_id": null,
+     },
+     Object {
+@@ -419,7 +419,7 @@ exports[`Transfer > transfers are properly inserted/updated/deleted 3`] = `
+       "amount": -5000,
+       "category": null,
+ @@ -57,11 +57,11 @@
+-      "id": "id8",
++      "id": "770a2c11-0f0f-5cca-b576-661b253fb5cc",
+       "imported_id": null,
+       "imported_payee": null,
+       "is_child": 0,
+@@ -477,7 +477,7 @@ exports[`Transfer > transfers are properly inserted/updated/deleted 5`] = `
+       "parent_id": null,
+ -     "payee": "id4",
+ -     "payee_name": "",
+-+     "payee": "id9",
+++     "payee": "id8",
+ +     "payee_name": "Not transferred anymore",
+       "raw_synced_data": null,
+       "reconciled": 0,
+@@ -485,7 +485,7 @@ exports[`Transfer > transfers are properly inserted/updated/deleted 5`] = `
+       "sort_order": 123456789,
+       "starting_balance_flag": 0,
+       "tombstone": 0,
+--     "transfer_id": "id8",
++-     "transfer_id": "770a2c11-0f0f-5cca-b576-661b253fb5cc",
+ +     "transfer_id": null,
+     },
+     Object {
+@@ -506,7 +506,7 @@ exports[`Transfer > transfers are properly inserted/updated/deleted 5`] = `
+ -     "cleared": 0,
+ -     "date": 20170101,
+ -     "error": null,
+--     "id": "id8",
++-     "id": "770a2c11-0f0f-5cca-b576-661b253fb5cc",
+ -     "imported_id": null,
+ -     "imported_payee": null,
+ -     "is_child": 0,
+@@ -536,7 +536,7 @@ exports[`Transfer > transfers are properly inserted/updated/deleted 6`] = `
+       "is_parent": 0,
+       "notes": "This is a note",
+       "parent_id": null,
+--     "payee": "id9",
++-     "payee": "id8",
+ -     "payee_name": "Not transferred anymore",
+ +     "payee": "id3",
+ +     "payee_name": "",
+@@ -547,7 +547,7 @@ exports[`Transfer > transfers are properly inserted/updated/deleted 6`] = `
+       "starting_balance_flag": 0,
+       "tombstone": 0,
+ -     "transfer_id": null,
+-+     "transfer_id": "id10",
+++     "transfer_id": "id9",
+ +   },
+ +   Object {
+ +     "account": "two",
+@@ -556,7 +556,7 @@ exports[`Transfer > transfers are properly inserted/updated/deleted 6`] = `
+ +     "cleared": 0,
+ +     "date": 20170105,
+ +     "error": null,
+-+     "id": "id10",
+++     "id": "id9",
+ +     "imported_id": null,
+ +     "imported_payee": null,
+ +     "is_child": 0,
+@@ -606,7 +606,7 @@ exports[`Transfer > transfers are properly inserted/updated/deleted 7`] = `
+ -     "sort_order": 123456789,
+ -     "starting_balance_flag": 0,
+ -     "tombstone": 0,
+--     "transfer_id": "id10",
++-     "transfer_id": "id9",
+ -   },
+ -   Object {
+ -     "account": "two",
+@@ -615,7 +615,7 @@ exports[`Transfer > transfers are properly inserted/updated/deleted 7`] = `
+ -     "cleared": 0,
+ -     "date": 20170105,
+ -     "error": null,
+--     "id": "id10",
++-     "id": "id9",
+ -     "imported_id": null,
+ -     "imported_payee": null,
+ -     "is_child": 0,
+diff --git a/packages/loot-core/src/server/transactions/app.ts b/packages/loot-core/src/server/transactions/app.ts
+index ce578ab7f..fc0f61f7f 100644
+--- a/packages/loot-core/src/server/transactions/app.ts
++++ b/packages/loot-core/src/server/transactions/app.ts
+@@ -1,7 +1,12 @@
++import * as connection from '#platform/server/connection';
++import { logger } from '#platform/server/log';
++import { resolveOpeningBalances } from '#server/accounts/opening-balances';
++import type { OpeningBalanceConflict } from '#server/accounts/opening-balances';
+ import { createApp } from '#server/app';
+ import { aqlQuery } from '#server/aql';
+ import * as db from '#server/db';
+-import { mutator } from '#server/mutators';
++import { mutator, runMutator } from '#server/mutators';
++import { batchMessages } from '#server/sync';
+ import { undoable } from '#server/undo';
+ import { q, Query } from '#shared/query';
+ import type { QueryState } from '#shared/query';
+@@ -12,10 +17,13 @@ import type {
+   TransactionEntity,
+ } from '#types/models';
+ 
++import { findDuplicateImports } from './duplicate-imports';
+ import { exportQueryToCSV, exportToCSV } from './export/export-to-csv';
+ import { parseFile } from './import/parse-file';
+ import type { ParseFileOptions } from './import/parse-file';
+ import { mergeTransactions } from './merge';
++import { alignSplitLines } from './split-lines';
++import { findTransferMismatches } from './transfer';
+ 
+ import { batchUpdateTransactions } from '.';
+ 
+@@ -167,3 +175,42 @@ app.method('transactions-export', mutator(exportTransactions));
+ app.method('transactions-export-query', mutator(exportTransactionsQuery));
+ app.method('get-earliest-transaction', getEarliestTransaction);
+ app.method('get-latest-transaction', getLatestTransaction);
++
++// Edits made on another device can leave data that no single device wrote.
++// Split lines away from their parent (an older app version, or a line and
++// its parent moved on different devices) are put back with the parent.
++// Transfers whose sides ended up with different amounts (both sides edited
++// at once on different devices) are never changed automatically, since that
++// would silently drop someone's figure: they are reported instead, on every
++// sync until someone fixes them. So are bank transactions that exist twice
++// in one account. An account linked to the bank on both devices keeps only
++// its earliest opening balance, and a later one that doesn't add up is
++// reported.
++app.events.on('sync', event => {
++  if (event.type !== 'success' || !db.getDatabase()) {
++    return;
++  }
++
++  void runMutator(async () => {
++    if (event.tables.includes('transactions')) {
++      let openingBalances: OpeningBalanceConflict[] = [];
++      await batchMessages(async () => {
++        await alignSplitLines();
++        openingBalances = await resolveOpeningBalances();
++      });
++      if (openingBalances.length > 0) {
++        connection.send('opening-balance-conflicts', {
++          conflicts: openingBalances,
++        });
++      }
++    }
++    connection.send('transfer-mismatches', {
++      mismatches: await findTransferMismatches(),
++    });
++    connection.send('duplicate-imports', {
++      duplicates: await findDuplicateImports(),
++    });
++  }).catch(error => {
++    logger.error('Failed to check transactions after sync', error);
++  });
++});
+diff --git a/packages/loot-core/src/server/transactions/duplicate-imports.ts b/packages/loot-core/src/server/transactions/duplicate-imports.ts
+new file mode 100644
+index 000000000..e00d2eef0
+--- /dev/null
++++ b/packages/loot-core/src/server/transactions/duplicate-imports.ts
+@@ -0,0 +1,45 @@
++import * as db from '#server/db';
++import { fromDateRepr } from '#server/models';
++
++export type DuplicateImport = {
++  accountName: string;
++  importedId: string;
++  count: number;
++  date: string;
++  amount: number;
++};
++
++/**
++ * Find bank transactions that exist more than once in the same account: two
++ * live rows sharing one bank id are always the same real transaction.
++ *
++ * Importing the same data on two devices no longer creates these, but they
++ * can still come from older data, or from a manual entry made on one device
++ * just before the other imported its bank transaction. They are reported,
++ * not merged, so that nobody's edits to either copy are dropped silently.
++ */
++export async function findDuplicateImports(): Promise<DuplicateImport[]> {
++  const rows = await db.all<{
++    account_name: string;
++    imported_id: string;
++    count: number;
++    date: number;
++    amount: number;
++  }>(
++    `SELECT a.name AS account_name, t.imported_id, COUNT(*) AS count,
++            MIN(t.date) AS date, MIN(t.amount) AS amount
++       FROM v_transactions_internal_alive t
++       LEFT JOIN accounts a ON a.id = t.account
++      WHERE t.imported_id IS NOT NULL AND t.imported_id != ''
++      GROUP BY t.account, t.imported_id
++     HAVING COUNT(*) > 1
++      ORDER BY date DESC`,
++  );
++  return rows.map(row => ({
++    accountName: row.account_name,
++    importedId: row.imported_id,
++    count: row.count,
++    date: fromDateRepr(row.date),
++    amount: row.amount,
++  }));
++}
+diff --git a/packages/loot-core/src/server/transactions/import/__snapshots__/parse-file.test.ts.snap b/packages/loot-core/src/server/transactions/import/__snapshots__/parse-file.test.ts.snap
+index 53e5e7377..5f32d9830 100644
+--- a/packages/loot-core/src/server/transactions/import/__snapshots__/parse-file.test.ts.snap
++++ b/packages/loot-core/src/server/transactions/import/__snapshots__/parse-file.test.ts.snap
+@@ -8,10 +8,10 @@ exports[`File import > CAMT.053 import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20131230,
+-    "description": "id2",
++    "description": "790ca5b3-f3c5-5477-a960-7d3cc5b42c0c",
+     "error": null,
+     "financial_id": "2013123001153870000",
+-    "id": "id5",
++    "id": "06b965a3-4883-5312-b60b-2ae13825a0cd",
+     "imported_description": "Testkonto Nummer 2",
+     "isChild": 0,
+     "isParent": 0,
+@@ -36,10 +36,10 @@ exports[`File import > CAMT.053 import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20131230,
+-    "description": "id2",
++    "description": "790ca5b3-f3c5-5477-a960-7d3cc5b42c0c",
+     "error": null,
+     "financial_id": "2013123001153870001",
+-    "id": "id6",
++    "id": "574d33f6-a35e-58c6-ba23-3ac361ac3f8e",
+     "imported_description": "Testkonto Nummer 2",
+     "isChild": 0,
+     "isParent": 0,
+@@ -64,10 +64,10 @@ exports[`File import > CAMT.053 import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20240311,
+-    "description": "id3",
++    "description": "ea1519e6-c603-5b0e-b4e9-a34d6bc40564",
+     "error": null,
+     "financial_id": "640387810124072/2",
+-    "id": "id7",
++    "id": "3dd601e6-1da4-58bf-b4bb-345fd86ab220",
+     "imported_description": "Supermarkt A",
+     "isChild": 0,
+     "isParent": 0,
+@@ -93,7 +93,7 @@ exports[`File import > CAMT.053 import works 1`] = `
+     "description": null,
+     "error": null,
+     "financial_id": "2014010509572410000",
+-    "id": "id8",
++    "id": "3acf38c8-04f0-528d-83f0-0c650d1b66f8",
+     "imported_description": null,
+     "isChild": 0,
+     "isParent": 0,
+@@ -119,10 +119,10 @@ exports[`File import > CAMT.053 import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20240312,
+-    "description": "id4",
++    "description": "084083d8-f810-5eb6-bdc5-bfd24ef5471a",
+     "error": null,
+     "financial_id": "367406715024072/1",
+-    "id": "id9",
++    "id": "2e095780-5440-5388-9432-117f2797b91a",
+     "imported_description": "Rega",
+     "isChild": 0,
+     "isParent": 0,
+@@ -145,10 +145,10 @@ exports[`File import > CAMT.053 import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20140103,
+-    "description": "id2",
++    "description": "790ca5b3-f3c5-5477-a960-7d3cc5b42c0c",
+     "error": null,
+     "financial_id": null,
+-    "id": "id10",
++    "id": "71f75dd1-2f7f-5ff4-9376-cce6d287fc79",
+     "imported_description": "Testkonto Nummer 2",
+     "isChild": 0,
+     "isParent": 0,
+@@ -171,10 +171,10 @@ exports[`File import > CAMT.053 import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20140103,
+-    "description": "id2",
++    "description": "790ca5b3-f3c5-5477-a960-7d3cc5b42c0c",
+     "error": null,
+     "financial_id": null,
+-    "id": "id11",
++    "id": "f1f18702-dfb9-55cb-88ad-6daa20ea9093",
+     "imported_description": "Testkonto Nummer 2",
+     "isChild": 0,
+     "isParent": 0,
+@@ -202,10 +202,10 @@ exports[`File import > handles UTF-8 encoding 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20221019,
+-    "description": "id2",
++    "description": "9edb06fc-7d87-5c79-80cf-fc2321b30fd8",
+     "error": null,
+     "financial_id": "cafeUtf8xx",
+-    "id": "id3",
++    "id": "3ed0cdc7-5f67-5cfd-b8b3-04af3f987e8f",
+     "imported_description": "Café Métro €uro",
+     "isChild": 0,
+     "isParent": 0,
+@@ -233,10 +233,10 @@ exports[`File import > handles html escaped plaintext 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20230509,
+-    "description": "id2",
++    "description": "60cca0d5-50e6-51c4-81b4-13696287a45a",
+     "error": null,
+     "financial_id": "23129130032333396279270000",
+-    "id": "id4",
++    "id": "5dbe968a-9ceb-5bda-af64-140652412c07",
+     "imported_description": "000000000000000",
+     "isChild": 0,
+     "isParent": 0,
+@@ -259,10 +259,10 @@ exports[`File import > handles html escaped plaintext 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20230301,
+-    "description": "id3",
++    "description": "b7e403a7-e9f8-5932-bc90-b539c4fca242",
+     "error": null,
+     "financial_id": "23060061032549554596530000",
+-    "id": "id5",
++    "id": "ef87157c-ec17-5555-a5ea-d180c391dff4",
+     "imported_description": "TPAY &lt;DEFTPYMT&gt;",
+     "isChild": 0,
+     "isParent": 0,
+@@ -290,10 +290,10 @@ exports[`File import > handles non-ASCII characters 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20221019,
+-    "description": "id2",
++    "description": "139d1ea7-4f49-569a-9112-57aa9c5780e2",
+     "error": null,
+     "financial_id": "wSoKuCS77",
+-    "id": "id3",
++    "id": "3eecb27e-63ba-50da-b325-2e1721f15d15",
+     "imported_description": "Paiement facture/Carte prépayée",
+     "isChild": 0,
+     "isParent": 0,
+@@ -321,10 +321,10 @@ exports[`File import > handles windows-1252 charset 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20221019,
+-    "description": "id2",
++    "description": "9edb06fc-7d87-5c79-80cf-fc2321b30fd8",
+     "error": null,
+     "financial_id": "cafe1252xx",
+-    "id": "id3",
++    "id": "9fa2e284-163b-5d8f-8d4e-64ebb43f186d",
+     "imported_description": "Café Métro €uro",
+     "isChild": 0,
+     "isParent": 0,
+@@ -352,10 +352,10 @@ exports[`File import > import notes are respected when importing > transactions
+     "category": null,
+     "cleared": 1,
+     "date": 20190123,
+-    "description": "id2",
++    "description": "bd40466e-4263-5515-9866-135a81c36771",
+     "error": null,
+     "financial_id": "00092990122-30.00019012312798.01",
+-    "id": "id10",
++    "id": "5e0661a6-4bd3-5d96-8182-aafaa579bfdf",
+     "imported_description": "PATIENT FIRST TOKEN 01/22 PURCHA",
+     "isChild": 0,
+     "isParent": 0,
+@@ -378,10 +378,10 @@ exports[`File import > import notes are respected when importing > transactions
+     "category": null,
+     "cleared": 1,
+     "date": 20190123,
+-    "description": "id3",
++    "description": "72eefc82-f364-5a44-8b60-a49a9b452ed2",
+     "error": null,
+     "financial_id": "00092990121-3.77019012312828.01",
+-    "id": "id11",
++    "id": "4501e115-6562-5b23-b792-f9daabddc7cd",
+     "imported_description": "STARBUCKS STORE 07604 01/21 PURC",
+     "isChild": 0,
+     "isParent": 0,
+@@ -404,10 +404,10 @@ exports[`File import > import notes are respected when importing > transactions
+     "category": null,
+     "cleared": 1,
+     "date": 20190123,
+-    "description": "id3",
++    "description": "72eefc82-f364-5a44-8b60-a49a9b452ed2",
+     "error": null,
+     "financial_id": "00092990121-9.62019012312831.78",
+-    "id": "id12",
++    "id": "1ce854e5-b83e-5bcd-a325-bdbddc851260",
+     "imported_description": "STARBUCKS STORE 07604 01/21 PURC",
+     "isChild": 0,
+     "isParent": 0,
+@@ -430,10 +430,10 @@ exports[`File import > import notes are respected when importing > transactions
+     "category": null,
+     "cleared": 1,
+     "date": 20190122,
+-    "description": "id4",
++    "description": "4c90a981-3a9f-546c-b711-8402e80e4df2",
+     "error": null,
+     "financial_id": "00090231800-115.99019012212841.40",
+-    "id": "id13",
++    "id": "66b777f3-fb42-5261-a2f8-376a5489f77f",
+     "imported_description": "VERIZON DES:PAYMENTREC ID:XXXXX3",
+     "isChild": 0,
+     "isParent": 0,
+@@ -456,10 +456,10 @@ exports[`File import > import notes are respected when importing > transactions
+     "category": null,
+     "cleared": 1,
+     "date": 20190122,
+-    "description": "id5",
++    "description": "341a7692-484d-5745-baf6-7983b31466d0",
+     "error": null,
+     "financial_id": "00092990120-10.34019012212957.39",
+-    "id": "id14",
++    "id": "351b4942-4aa6-5c31-a628-ddd7880219d4",
+     "imported_description": "URBAN FARMHOUSE NO 2 01/19 PURCH",
+     "isChild": 0,
+     "isParent": 0,
+@@ -482,10 +482,10 @@ exports[`File import > import notes are respected when importing > transactions
+     "category": null,
+     "cleared": 1,
+     "date": 20190122,
+-    "description": "id5",
++    "description": "341a7692-484d-5745-baf6-7983b31466d0",
+     "error": null,
+     "financial_id": "00092990120-22.53019012212967.73",
+-    "id": "id15",
++    "id": "ced8b1c4-07d9-5588-aa2d-c149d6461934",
+     "imported_description": "URBAN FARMHOUSE NO 2 01/19 PURCH",
+     "isChild": 0,
+     "isParent": 0,
+@@ -508,10 +508,10 @@ exports[`File import > import notes are respected when importing > transactions
+     "category": null,
+     "cleared": 1,
+     "date": 20190122,
+-    "description": "id6",
++    "description": "98daed4f-c339-5731-a8e1-efa1aba03161",
+     "error": null,
+     "financial_id": "00092990119-108.71019012212990.26",
+-    "id": "id16",
++    "id": "f61a4ee9-4c24-52ee-a5d4-3243ba861777",
+     "imported_description": "TMOBILE*AUTO PAY 01/19 PURCHASE",
+     "isChild": 0,
+     "isParent": 0,
+@@ -534,10 +534,10 @@ exports[`File import > import notes are respected when importing > transactions
+     "category": null,
+     "cleared": 1,
+     "date": 20190122,
+-    "description": "id7",
++    "description": "00f4a8ae-79f6-5397-aa7c-974813217def",
+     "error": null,
+     "financial_id": "00092990118-25.00019012213098.97",
+-    "id": "id17",
++    "id": "29b6f587-bb8e-5472-9e58-53ad1f54c222",
+     "imported_description": "COUNTY WASTE 01/18 PURCHASE 804-",
+     "isChild": 0,
+     "isParent": 0,
+@@ -560,10 +560,10 @@ exports[`File import > import notes are respected when importing > transactions
+     "category": null,
+     "cleared": 1,
+     "date": 20190122,
+-    "description": "id8",
++    "description": "0450e3a5-2ae7-55c5-83a8-ee028583e972",
+     "error": null,
+     "financial_id": "00092990118-32.38019012213123.97",
+-    "id": "id18",
++    "id": "a806150f-eeb4-57b5-90eb-714103f475e6",
+     "imported_description": "REGENCY MART CITGO 01/18 PURCHAS",
+     "isChild": 0,
+     "isParent": 0,
+@@ -586,10 +586,10 @@ exports[`File import > import notes are respected when importing > transactions
+     "category": null,
+     "cleared": 1,
+     "date": 20190122,
+-    "description": "id9",
++    "description": "690fcf8f-0c53-5fc6-ac6b-55d3a63af02c",
+     "error": null,
+     "financial_id": "00092990117-6.07019012213156.35",
+-    "id": "id19",
++    "id": "0706f00e-3be3-5044-b73d-40edca094c1f",
+     "imported_description": "CHICK-FIL-A #01342 01/17 PURCHAS",
+     "isChild": 0,
+     "isParent": 0,
+@@ -617,10 +617,10 @@ exports[`File import > ofx import works (credit card) 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20230330,
+-    "description": "id2",
++    "description": "171e4104-4d1b-5ac7-bc10-f65bbd8ff1b7",
+     "error": null,
+     "financial_id": "57f91dca-0460-4692-be90-84165b7002",
+-    "id": "id3",
++    "id": "257008d8-7b93-58a2-a5a9-e981597181af",
+     "imported_description": "LOUISIANA STATE MUSEUM751 PLACE JOHN PAUL NEW ORLEANS 70116-3205LA USA",
+     "isChild": 0,
+     "isParent": 0,
+@@ -648,10 +648,10 @@ exports[`File import > ofx import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20190123,
+-    "description": "id2",
++    "description": "bd40466e-4263-5515-9866-135a81c36771",
+     "error": null,
+     "financial_id": "00092990122-30.00019012312798.01",
+-    "id": "id10",
++    "id": "5e0661a6-4bd3-5d96-8182-aafaa579bfdf",
+     "imported_description": "PATIENT FIRST TOKEN 01/22 PURCHA",
+     "isChild": 0,
+     "isParent": 0,
+@@ -674,10 +674,10 @@ exports[`File import > ofx import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20190123,
+-    "description": "id3",
++    "description": "72eefc82-f364-5a44-8b60-a49a9b452ed2",
+     "error": null,
+     "financial_id": "00092990121-3.77019012312828.01",
+-    "id": "id11",
++    "id": "4501e115-6562-5b23-b792-f9daabddc7cd",
+     "imported_description": "STARBUCKS STORE 07604 01/21 PURC",
+     "isChild": 0,
+     "isParent": 0,
+@@ -700,10 +700,10 @@ exports[`File import > ofx import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20190123,
+-    "description": "id3",
++    "description": "72eefc82-f364-5a44-8b60-a49a9b452ed2",
+     "error": null,
+     "financial_id": "00092990121-9.62019012312831.78",
+-    "id": "id12",
++    "id": "1ce854e5-b83e-5bcd-a325-bdbddc851260",
+     "imported_description": "STARBUCKS STORE 07604 01/21 PURC",
+     "isChild": 0,
+     "isParent": 0,
+@@ -726,10 +726,10 @@ exports[`File import > ofx import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20190122,
+-    "description": "id4",
++    "description": "4c90a981-3a9f-546c-b711-8402e80e4df2",
+     "error": null,
+     "financial_id": "00090231800-115.99019012212841.40",
+-    "id": "id13",
++    "id": "66b777f3-fb42-5261-a2f8-376a5489f77f",
+     "imported_description": "VERIZON DES:PAYMENTREC ID:XXXXX3",
+     "isChild": 0,
+     "isParent": 0,
+@@ -752,10 +752,10 @@ exports[`File import > ofx import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20190122,
+-    "description": "id5",
++    "description": "341a7692-484d-5745-baf6-7983b31466d0",
+     "error": null,
+     "financial_id": "00092990120-10.34019012212957.39",
+-    "id": "id14",
++    "id": "351b4942-4aa6-5c31-a628-ddd7880219d4",
+     "imported_description": "URBAN FARMHOUSE NO 2 01/19 PURCH",
+     "isChild": 0,
+     "isParent": 0,
+@@ -778,10 +778,10 @@ exports[`File import > ofx import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20190122,
+-    "description": "id5",
++    "description": "341a7692-484d-5745-baf6-7983b31466d0",
+     "error": null,
+     "financial_id": "00092990120-22.53019012212967.73",
+-    "id": "id15",
++    "id": "ced8b1c4-07d9-5588-aa2d-c149d6461934",
+     "imported_description": "URBAN FARMHOUSE NO 2 01/19 PURCH",
+     "isChild": 0,
+     "isParent": 0,
+@@ -804,10 +804,10 @@ exports[`File import > ofx import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20190122,
+-    "description": "id6",
++    "description": "98daed4f-c339-5731-a8e1-efa1aba03161",
+     "error": null,
+     "financial_id": "00092990119-108.71019012212990.26",
+-    "id": "id16",
++    "id": "f61a4ee9-4c24-52ee-a5d4-3243ba861777",
+     "imported_description": "TMOBILE*AUTO PAY 01/19 PURCHASE",
+     "isChild": 0,
+     "isParent": 0,
+@@ -830,10 +830,10 @@ exports[`File import > ofx import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20190122,
+-    "description": "id7",
++    "description": "00f4a8ae-79f6-5397-aa7c-974813217def",
+     "error": null,
+     "financial_id": "00092990118-25.00019012213098.97",
+-    "id": "id17",
++    "id": "29b6f587-bb8e-5472-9e58-53ad1f54c222",
+     "imported_description": "COUNTY WASTE 01/18 PURCHASE 804-",
+     "isChild": 0,
+     "isParent": 0,
+@@ -856,10 +856,10 @@ exports[`File import > ofx import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20190122,
+-    "description": "id8",
++    "description": "0450e3a5-2ae7-55c5-83a8-ee028583e972",
+     "error": null,
+     "financial_id": "00092990118-32.38019012213123.97",
+-    "id": "id18",
++    "id": "a806150f-eeb4-57b5-90eb-714103f475e6",
+     "imported_description": "REGENCY MART CITGO 01/18 PURCHAS",
+     "isChild": 0,
+     "isParent": 0,
+@@ -882,10 +882,10 @@ exports[`File import > ofx import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20190122,
+-    "description": "id9",
++    "description": "690fcf8f-0c53-5fc6-ac6b-55d3a63af02c",
+     "error": null,
+     "financial_id": "00092990117-6.07019012213156.35",
+-    "id": "id19",
++    "id": "0706f00e-3be3-5044-b73d-40edca094c1f",
+     "imported_description": "CHICK-FIL-A #01342 01/17 PURCHAS",
+     "isChild": 0,
+     "isParent": 0,
+@@ -913,10 +913,10 @@ exports[`File import > qfx import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20190123,
+-    "description": "id2",
++    "description": "bd40466e-4263-5515-9866-135a81c36771",
+     "error": null,
+     "financial_id": "00092990122-30.00019012312798.01",
+-    "id": "id10",
++    "id": "5e0661a6-4bd3-5d96-8182-aafaa579bfdf",
+     "imported_description": "PATIENT FIRST TOKEN 01/22 PURCHA",
+     "isChild": 0,
+     "isParent": 0,
+@@ -939,10 +939,10 @@ exports[`File import > qfx import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20190123,
+-    "description": "id3",
++    "description": "72eefc82-f364-5a44-8b60-a49a9b452ed2",
+     "error": null,
+     "financial_id": "00092990121-3.77019012312828.01",
+-    "id": "id11",
++    "id": "4501e115-6562-5b23-b792-f9daabddc7cd",
+     "imported_description": "STARBUCKS STORE 07604 01/21 PURC",
+     "isChild": 0,
+     "isParent": 0,
+@@ -965,10 +965,10 @@ exports[`File import > qfx import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20190123,
+-    "description": "id3",
++    "description": "72eefc82-f364-5a44-8b60-a49a9b452ed2",
+     "error": null,
+     "financial_id": "00092990121-9.62019012312831.78",
+-    "id": "id12",
++    "id": "1ce854e5-b83e-5bcd-a325-bdbddc851260",
+     "imported_description": "STARBUCKS STORE 07604 01/21 PURC",
+     "isChild": 0,
+     "isParent": 0,
+@@ -991,10 +991,10 @@ exports[`File import > qfx import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20190122,
+-    "description": "id4",
++    "description": "4c90a981-3a9f-546c-b711-8402e80e4df2",
+     "error": null,
+     "financial_id": "00090231800-115.99019012212841.40",
+-    "id": "id13",
++    "id": "66b777f3-fb42-5261-a2f8-376a5489f77f",
+     "imported_description": "VERIZON DES:PAYMENTREC ID:XXXXX3",
+     "isChild": 0,
+     "isParent": 0,
+@@ -1017,10 +1017,10 @@ exports[`File import > qfx import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20190122,
+-    "description": "id5",
++    "description": "341a7692-484d-5745-baf6-7983b31466d0",
+     "error": null,
+     "financial_id": "00092990120-10.34019012212957.39",
+-    "id": "id14",
++    "id": "351b4942-4aa6-5c31-a628-ddd7880219d4",
+     "imported_description": "URBAN FARMHOUSE NO 2 01/19 PURCH",
+     "isChild": 0,
+     "isParent": 0,
+@@ -1043,10 +1043,10 @@ exports[`File import > qfx import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20190122,
+-    "description": "id5",
++    "description": "341a7692-484d-5745-baf6-7983b31466d0",
+     "error": null,
+     "financial_id": "00092990120-22.53019012212967.73",
+-    "id": "id15",
++    "id": "ced8b1c4-07d9-5588-aa2d-c149d6461934",
+     "imported_description": "URBAN FARMHOUSE NO 2 01/19 PURCH",
+     "isChild": 0,
+     "isParent": 0,
+@@ -1069,10 +1069,10 @@ exports[`File import > qfx import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20190122,
+-    "description": "id6",
++    "description": "98daed4f-c339-5731-a8e1-efa1aba03161",
+     "error": null,
+     "financial_id": "00092990119-108.71019012212990.26",
+-    "id": "id16",
++    "id": "f61a4ee9-4c24-52ee-a5d4-3243ba861777",
+     "imported_description": "TMOBILE*AUTO PAY 01/19 PURCHASE",
+     "isChild": 0,
+     "isParent": 0,
+@@ -1095,10 +1095,10 @@ exports[`File import > qfx import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20190122,
+-    "description": "id7",
++    "description": "00f4a8ae-79f6-5397-aa7c-974813217def",
+     "error": null,
+     "financial_id": "00092990118-25.00019012213098.97",
+-    "id": "id17",
++    "id": "29b6f587-bb8e-5472-9e58-53ad1f54c222",
+     "imported_description": "COUNTY WASTE 01/18 PURCHASE 804-",
+     "isChild": 0,
+     "isParent": 0,
+@@ -1121,10 +1121,10 @@ exports[`File import > qfx import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20190122,
+-    "description": "id8",
++    "description": "0450e3a5-2ae7-55c5-83a8-ee028583e972",
+     "error": null,
+     "financial_id": "00092990118-32.38019012213123.97",
+-    "id": "id18",
++    "id": "a806150f-eeb4-57b5-90eb-714103f475e6",
+     "imported_description": "REGENCY MART CITGO 01/18 PURCHAS",
+     "isChild": 0,
+     "isParent": 0,
+@@ -1147,10 +1147,10 @@ exports[`File import > qfx import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20190122,
+-    "description": "id9",
++    "description": "690fcf8f-0c53-5fc6-ac6b-55d3a63af02c",
+     "error": null,
+     "financial_id": "00092990117-6.07019012213156.35",
+-    "id": "id19",
++    "id": "0706f00e-3be3-5044-b73d-40edca094c1f",
+     "imported_description": "CHICK-FIL-A #01342 01/17 PURCHAS",
+     "isChild": 0,
+     "isParent": 0,
+@@ -1178,10 +1178,10 @@ exports[`File import > qif import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20181219,
+-    "description": "id2",
++    "description": "aa252ca0-96d7-5299-af09-5279bc1031f8",
+     "error": null,
+     "financial_id": null,
+-    "id": "id19",
++    "id": "8af8102d-7e5e-5661-9a18-be8697a4ce75",
+     "imported_description": "COUNTY WASTE 12/18 PURCHASE 804-8439288 VA",
+     "isChild": 0,
+     "isParent": 0,
+@@ -1204,10 +1204,10 @@ exports[`File import > qif import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20181219,
+-    "description": "id3",
++    "description": "82e694b2-facc-55dd-880f-4b667ec891cb",
+     "error": null,
+     "financial_id": null,
+-    "id": "id20",
++    "id": "238f253d-ca76-59a1-a8ef-0917d65f53f0",
+     "imported_description": "õSSELDORF KÖLN SALON - LIBBIE GR 12/18 PURCHASE RICHMOND VA",
+     "isChild": 0,
+     "isParent": 0,
+@@ -1230,10 +1230,10 @@ exports[`File import > qif import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20181219,
+-    "description": "id4",
++    "description": "de9f45fc-4a99-5844-9567-5f3baf249efa",
+     "error": null,
+     "financial_id": null,
+-    "id": "id21",
++    "id": "deecb6ec-db55-5abe-bcff-15f2571bb2b3",
+     "imported_description": "LOFT 0845 CHES 12/19 PURCHASE RICHMOND VA",
+     "isChild": 0,
+     "isParent": 0,
+@@ -1256,10 +1256,10 @@ exports[`File import > qif import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20181219,
+-    "description": "id5",
++    "description": "330b7c01-6932-576f-b849-934cb6d0fc5e",
+     "error": null,
+     "financial_id": null,
+-    "id": "id22",
++    "id": "0fb061af-cbbd-52f8-89dc-3286d2f2f016",
+     "imported_description": "TARGET T- 1130 12/19 PURCHASE Richmond VA",
+     "isChild": 0,
+     "isParent": 0,
+@@ -1282,10 +1282,10 @@ exports[`File import > qif import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20181219,
+-    "description": "id6",
++    "description": "877c8edb-b372-5d06-8bcb-cf5dd1ad58fe",
+     "error": null,
+     "financial_id": null,
+-    "id": "id23",
++    "id": "e1268771-19ed-5d5e-9531-b1608e0349e5",
+     "imported_description": "TARGET DEBIT CRD ACH TRAN CO ID:XXXXX15170 POS TARGET -1018 RICHMOND V",
+     "isChild": 0,
+     "isParent": 0,
+@@ -1308,10 +1308,10 @@ exports[`File import > qif import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20181219,
+-    "description": "id7",
++    "description": "14040e32-f8e8-5f72-9758-6dec86286e5f",
+     "error": null,
+     "financial_id": null,
+-    "id": "id24",
++    "id": "af6b5aa1-93c5-5040-90e5-222400106927",
+     "imported_description": "TARGET DEBIT CRD DES:ACH TRAN ID:XXXXX0370723991 INDN:S LONG 9321 CO I",
+     "isChild": 0,
+     "isParent": 0,
+@@ -1334,10 +1334,10 @@ exports[`File import > qif import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20181219,
+-    "description": "id8",
++    "description": "06681cea-6ffa-544b-8db6-ee47ab8a91cb",
+     "error": null,
+     "financial_id": null,
+-    "id": "id25",
++    "id": "eed745ea-ba0a-5097-b211-01af0b8aee16",
+     "imported_description": "TARGET DEBIT CRD DES:ACH TRAN ID:XXXXX0370723991 INDN:S LONG 9703 CO I",
+     "isChild": 0,
+     "isParent": 0,
+@@ -1360,10 +1360,10 @@ exports[`File import > qif import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20181220,
+-    "description": "id9",
++    "description": "6f500737-5061-5adc-86cc-6b4d004b9429",
+     "error": null,
+     "financial_id": null,
+-    "id": "id26",
++    "id": "9a79f659-2a45-597e-98ce-f62246872b27",
+     "imported_description": "BKOFAMERICA MOBILE 12/20 3705340250 DEPOSIT *MOBILE VA",
+     "isChild": 0,
+     "isParent": 0,
+@@ -1386,10 +1386,10 @@ exports[`File import > qif import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20181220,
+-    "description": "id10",
++    "description": "60df335b-9f18-5f46-ad75-e3af1a879075",
+     "error": null,
+     "financial_id": null,
+-    "id": "id27",
++    "id": "e345b3ac-189b-5ca1-80ca-8134793f196f",
+     "imported_description": "AMAZON.COM*M21KD0HA0 AM 12/19 PURCHASE AMZN.COM/BILL WA",
+     "isChild": 0,
+     "isParent": 0,
+@@ -1412,10 +1412,10 @@ exports[`File import > qif import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20181220,
+-    "description": "id11",
++    "description": "b425dbfe-b144-5e9b-bcf4-877070f95451",
+     "error": null,
+     "financial_id": null,
+-    "id": "id28",
++    "id": "527d34fa-d6b8-5161-9898-99a4bfb6a012",
+     "imported_description": "TARGET DEBIT CRD DES:ACH TRAN ID:XXXXX0370723991 INDN:S LONG 6486 CO I",
+     "isChild": 0,
+     "isParent": 0,
+@@ -1438,10 +1438,10 @@ exports[`File import > qif import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20181221,
+-    "description": "id12",
++    "description": "b9a3d3ac-3a7c-53ec-9418-d1a1f0d5663d",
+     "error": null,
+     "financial_id": null,
+-    "id": "id29",
++    "id": "391f87ea-4830-572e-abc9-e3d255746534",
+     "imported_description": "STARBUCKS STORE 07604 12/19 PURCHASE RICHMOND VA",
+     "isChild": 0,
+     "isParent": 0,
+@@ -1464,10 +1464,10 @@ exports[`File import > qif import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20181221,
+-    "description": "id13",
++    "description": "47c986af-1ba3-5484-8f22-57751c45638f",
+     "error": null,
+     "financial_id": null,
+-    "id": "id30",
++    "id": "a46e9d2a-78f3-5418-a64c-0cbc811a3d41",
+     "imported_description": "AMAZON.COM*M236431E2 AM 12/19 PURCHASE AMZN.COM/BILL WA",
+     "isChild": 0,
+     "isParent": 0,
+@@ -1490,10 +1490,10 @@ exports[`File import > qif import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20181221,
+-    "description": "id12",
++    "description": "b9a3d3ac-3a7c-53ec-9418-d1a1f0d5663d",
+     "error": null,
+     "financial_id": null,
+-    "id": "id31",
++    "id": "39155dfc-f6d3-577a-b87b-c53da5e94c43",
+     "imported_description": "STARBUCKS STORE 07604 12/19 PURCHASE RICHMOND VA",
+     "isChild": 0,
+     "isParent": 0,
+@@ -1516,10 +1516,10 @@ exports[`File import > qif import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20181221,
+-    "description": "id14",
++    "description": "1bb464bb-80e8-5e58-ae5d-9c6e9989d362",
+     "error": null,
+     "financial_id": null,
+-    "id": "id32",
++    "id": "dedeb5ca-ecc8-562c-9788-65818a85ae51",
+     "imported_description": "AMAZON.COM*M208P98U1 AM 12/19 PURCHASE AMZN.COM/BILL WA",
+     "isChild": 0,
+     "isParent": 0,
+@@ -1542,10 +1542,10 @@ exports[`File import > qif import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20181221,
+-    "description": "id15",
++    "description": "bc0eb112-fe41-5d78-8d78-af4049a00927",
+     "error": null,
+     "financial_id": null,
+-    "id": "id33",
++    "id": "850f0526-f67a-5f43-84b6-54bf64ad4fca",
+     "imported_description": "AMAZON.COM*M29QF7M71 AM 12/19 PURCHASE AMZN.COM/BILL WA",
+     "isChild": 0,
+     "isParent": 0,
+@@ -1568,10 +1568,10 @@ exports[`File import > qif import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20181221,
+-    "description": "id16",
++    "description": "cf6d0c7a-9db3-5107-88f1-2e0b66c6ca84",
+     "error": null,
+     "financial_id": null,
+-    "id": "id34",
++    "id": "bfbb8519-b4f1-5db1-be10-f8b3e32d21a9",
+     "imported_description": "AMAZON.COM*M20VB1851 AM 12/20 PURCHASE AMZN.COM/BILL WA",
+     "isChild": 0,
+     "isParent": 0,
+@@ -1594,10 +1594,10 @@ exports[`File import > qif import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20181221,
+-    "description": "id17",
++    "description": "149f9732-02f2-5084-950e-a7ab1d9cda72",
+     "error": null,
+     "financial_id": null,
+-    "id": "id35",
++    "id": "fb6e4343-9cf6-52d1-8c2f-ec576526b4ec",
+     "imported_description": "AMZN MKTP US*M27HH51C2 12/20 PURCHASE AMZN.COM/BILL WA",
+     "isChild": 0,
+     "isParent": 0,
+@@ -1620,10 +1620,10 @@ exports[`File import > qif import works 1`] = `
+     "category": null,
+     "cleared": 1,
+     "date": 20181221,
+-    "description": "id18",
++    "description": "78d69400-1614-58c9-afd0-2c96fcb8f6b1",
+     "error": null,
+     "financial_id": null,
+-    "id": "id36",
++    "id": "10740939-ee4f-500e-bf6d-167f07a1989f",
+     "imported_description": "CVS/PHARM 0154 12/21 PURCHASE RICHMOND VA",
+     "isChild": 0,
+     "isParent": 0,
+diff --git a/packages/loot-core/src/server/transactions/import/ofx2json.test.ts b/packages/loot-core/src/server/transactions/import/ofx2json.test.ts
+index 87c842a92..de06d5ce0 100644
+--- a/packages/loot-core/src/server/transactions/import/ofx2json.test.ts
++++ b/packages/loot-core/src/server/transactions/import/ofx2json.test.ts
+@@ -1,4 +1,4 @@
+-import { html2Plain } from './ofx2json';
++import { html2Plain, ofx2json } from './ofx2json';
+ 
+ describe('html2Plain', () => {
+   test('regular text works', async () => {
+@@ -31,3 +31,57 @@ describe('html2Plain', () => {
+     );
+   });
+ });
++
++describe('ofx2json', () => {
++  function investmentStatement(bankTransactions: string) {
++    return `OFXHEADER:100
++DATA:OFXSGML
++
++<OFX>
++<INVSTMTMSGSRSV1>
++<INVSTMTTRNRS>
++<INVSTMTRS>
++<INVTRANLIST>
++${bankTransactions}
++</INVTRANLIST>
++</INVSTMTRS>
++</INVSTMTTRNRS>
++</INVSTMTMSGSRSV1>
++</OFX>`;
++  }
++
++  function bankTransaction(fitId: string, amount: string) {
++    return `<INVBANKTRAN>
++<STMTTRN>
++<TRNTYPE>CREDIT</TRNTYPE>
++<DTPOSTED>20240115</DTPOSTED>
++<TRNAMT>${amount}</TRNAMT>
++<FITID>${fitId}</FITID>
++<NAME>Dividend</NAME>
++</STMTTRN>
++<SUBACCTFUND>CASH</SUBACCTFUND>
++</INVBANKTRAN>`;
++  }
++
++  test('parses an investment statement with a single bank transaction', async () => {
++    const { transactions } = await ofx2json(
++      investmentStatement(bankTransaction('1', '12.34')),
++    );
++    expect(transactions).toEqual([
++      expect.objectContaining({
++        fitId: '1',
++        amount: '12.34',
++        date: '2024-01-15',
++      }),
++    ]);
++  });
++
++  test('parses an investment statement with several bank transactions', async () => {
++    const { transactions } = await ofx2json(
++      investmentStatement(
++        bankTransaction('1', '12.34') + bankTransaction('2', '-5.00'),
++      ),
++    );
++    expect(transactions.map(t => t.fitId)).toEqual(['1', '2']);
++  });
++});
+diff --git a/packages/loot-core/src/server/transactions/import/ofx2json.ts b/packages/loot-core/src/server/transactions/import/ofx2json.ts
+index 649e28605..99d77e588 100644
+--- a/packages/loot-core/src/server/transactions/import/ofx2json.ts
++++ b/packages/loot-core/src/server/transactions/import/ofx2json.ts
+@@ -92,8 +92,9 @@ function getInvStmtTrn(ofx) {
+   const result = stmtTrnRs.flatMap(s => {
+     const stmtRs = s?.['INVSTMTRS'];
+     const tranList = stmtRs?.['INVTRANLIST'];
+-    const stmtTrn = tranList?.['INVBANKTRAN']?.flatMap(t => t?.['STMTTRN']);
+-    return getAsArray(stmtTrn);
++    return getAsArray(tranList?.['INVBANKTRAN']).flatMap(t =>
++      getAsArray(t?.['STMTTRN']),
++    );
+   });
+   return result;
+ }
+diff --git a/packages/loot-core/src/server/transactions/index.ts b/packages/loot-core/src/server/transactions/index.ts
+index ebb8f8277..c04c40177 100644
+--- a/packages/loot-core/src/server/transactions/index.ts
++++ b/packages/loot-core/src/server/transactions/index.ts
+@@ -7,6 +7,7 @@ import { batchMessages } from '#server/sync';
+ import type { Diff } from '#shared/util';
+ import type { PayeeEntity, TransactionEntity } from '#types/models';
+ 
++import { alignSplitLines, getSplitParentIds } from './split-lines';
+ import * as rules from './transaction-rules';
+ import * as transfer from './transfer';
+ 
+@@ -127,6 +128,30 @@ export async function batchUpdateTransactions({
+     }
+   });
+ 
++  // A split's lines always follow the parent's date and account. Whatever
++  // just moved part of a split (an edit, a rule, bank sync updating dates),
++  // put the rest of it back with the parent.
++  const splitParentIds = await getSplitParentIds([
++    ...(added ?? []).filter(t => t.is_parent || t.is_child).map(t => t.id),
++    ...(updated ?? [])
++      .filter(
++        t =>
++          'date' in t ||
++          'account' in t ||
++          'parent_id' in t ||
++          'is_parent' in t ||
++          'is_child' in t,
++      )
++      .map(t => t.id),
++  ]);
++  let alignedIds: string[] = [];
++  if (splitParentIds.length > 0) {
++    await batchMessages(async () => {
++      alignedIds = await alignSplitLines(splitParentIds);
++    });
++  }
++  const changedUpdatedIds = [...updatedIds, ...alignedIds];
++
+   // Get all of the full transactions that were changed. This is
+   // needed to run any cascading logic that depends on the full
+   // transaction. Things like transfers, analyzing rule updates, and
+@@ -135,7 +160,7 @@ export async function batchUpdateTransactions({
+   // One read for all of them: on the web backend every query is a
+   // separate lock/commit cycle against IndexedDB
+   const changedTransactions = await getTransactionsByIds([
+-    ...new Set([...addedIds, ...updatedIds, ...deletedIds]),
++    ...new Set([...addedIds, ...changedUpdatedIds, ...deletedIds]),
+   ]);
+   const changedById = new Map(
+     changedTransactions.map(transaction => [transaction.id, transaction]),
+@@ -147,7 +172,7 @@ export async function batchUpdateTransactions({
+         Boolean(transaction),
+       );
+   const allAdded = pickTransactions(addedIds);
+-  const allUpdated = pickTransactions(updatedIds);
++  const allUpdated = pickTransactions(changedUpdatedIds);
+   const allDeleted = pickTransactions(deletedIds);
+ 
+   // Post-processing phase: first do any updates to transfers.
+diff --git a/packages/loot-core/src/server/transactions/merge.test.ts b/packages/loot-core/src/server/transactions/merge.test.ts
+index 28aa35e8a..02b83daa9 100644
+--- a/packages/loot-core/src/server/transactions/merge.test.ts
++++ b/packages/loot-core/src/server/transactions/merge.test.ts
+@@ -466,6 +466,30 @@ describe('Merging success', () => {
+     expect(t1R?.imported_payee).toBe('payee_import_2');
+   });
+ 
++  it('keeps the notes of both sides of a merged transfer in sync', async () => {
++    const t1 = await db.insertTransaction({
++      ...transaction1,
++      notes: 'from the bank',
++      imported_id: 'import_1',
++    });
++    const t2 = await db.insertTransaction({ ...transaction2, notes: null });
++    const t2Transfer = await db.insertTransaction({
++      ...transaction2,
++      account: 'one',
++      amount: -transaction2.amount,
++      notes: null,
++      transfer_id: t2,
++    });
++    await db.updateTransaction({ id: t2, transfer_id: t2Transfer });
++
++    expect(await mergeTransactions([{ id: t1 }, { id: t2 }])).toBe(t1);
++    const transactions = await getAllTransactions();
++    expect(transactions.find(tx => tx.id === t1)?.notes).toBe('from the bank');
++    expect(transactions.find(tx => tx.id === t2Transfer)?.notes).toBe(
++      'from the bank',
++    );
++  });
++
+   it('merging two transfers selects the best transaction in each account to preserve', async () => {
+     // A -> B
+     const a = await db.insertTransaction({
+diff --git a/packages/loot-core/src/server/transactions/merge.ts b/packages/loot-core/src/server/transactions/merge.ts
+index e42c2e0d0..e0e0cb1fd 100644
+--- a/packages/loot-core/src/server/transactions/merge.ts
++++ b/packages/loot-core/src/server/transactions/merge.ts
+@@ -8,6 +8,8 @@ import {
+ } from '#shared/transactions';
+ import type { TransactionEntity } from '#types/models';
+ 
++import { alignSplitLines } from './split-lines';
++
+ import { batchUpdateTransactions } from '.';
+ 
+ export async function mergeTransactions(
+@@ -39,7 +41,14 @@ export async function mergeTransactions(
+       transfer_id: transferId,
+       payee: transferAccount,
+     });
+-    await db.updateTransaction({ id: transferId, transfer_id: keptTxId });
++    // Notes always mirror across a transfer, and the merge may have taken
++    // them from the other transaction
++    const kept = await db.getTransaction(keptTxId);
++    await db.updateTransaction({
++      id: transferId,
++      transfer_id: keptTxId,
++      notes: kept?.notes ?? null,
++    });
+   }
+ 
+   // transfers to an off-budget account have a category. Transfers to on-budget do not, so
+@@ -164,6 +173,8 @@ export async function mergeTransactionsNoTransfer(
+       reconciled: keep.reconciled || drop.reconciled,
+       schedule: keep.schedule || drop.schedule,
+     } as unknown as TransactionEntity);
++    // The moved lines take the kept transaction's date and account
++    await alignSplitLines([keep.id]);
+   } else {
+     // Normal merge without subtransactions
+     await db.updateTransaction({
+diff --git a/packages/loot-core/src/server/transactions/split-lines.test.ts b/packages/loot-core/src/server/transactions/split-lines.test.ts
+new file mode 100644
+index 000000000..335f9f405
+--- /dev/null
++++ b/packages/loot-core/src/server/transactions/split-lines.test.ts
+@@ -0,0 +1,145 @@
++import { beforeEach, describe, expect, it } from 'vitest';
++
++import * as db from '#server/db';
++
++import { mergeTransactions } from './merge';
++import { alignSplitLines } from './split-lines';
++
++import { batchUpdateTransactions } from './index';
++
++beforeEach(global.emptyDatabase());
++
++async function setup() {
++  await db.insertAccount({ id: 'one', name: 'one' });
++  await db.insertAccount({ id: 'two', name: 'two' });
++  await db.insertPayee({ id: 'transfer-one', name: '', transfer_acct: 'one' });
++  await db.insertPayee({ id: 'transfer-two', name: '', transfer_acct: 'two' });
++  await db.insertAccount({ id: 'three', name: 'three' });
++  await db.insertPayee({
++    id: 'transfer-three',
++    name: '',
++    transfer_acct: 'three',
++  });
++
++  await batchUpdateTransactions({
++    added: [
++      {
++        id: 'parent',
++        account: 'one',
++        amount: -100,
++        date: '2024-01-31',
++        is_parent: true,
++      },
++      {
++        id: 'line1',
++        account: 'one',
++        amount: -60,
++        date: '2024-01-31',
++        is_child: true,
++        parent_id: 'parent',
++      },
++      {
++        id: 'line2',
++        account: 'one',
++        amount: -40,
++        date: '2024-01-31',
++        is_child: true,
++        parent_id: 'parent',
++        payee: 'transfer-three',
++      },
++    ],
++  });
++}
++
++function getLines() {
++  return db.all<{ id: string; date: number; account: string }>(
++    `SELECT id, date, account FROM v_transactions_internal
++      WHERE parent_id = 'parent' AND tombstone = 0 ORDER BY id`,
++  );
++}
++
++describe('split lines stay with their parent', () => {
++  it('moves the lines when only the parent date is changed', async () => {
++    await setup();
++
++    // What a rule setting the date, or bank sync updating dates, sends
++    await batchUpdateTransactions({
++      updated: [{ id: 'parent', date: '2024-02-01' }],
++    });
++
++    expect(await getLines()).toEqual([
++      { id: 'line1', date: 20240201, account: 'one' },
++      { id: 'line2', date: 20240201, account: 'one' },
++    ]);
++  });
++
++  it('puts a line back when only the line date is changed', async () => {
++    await setup();
++
++    await batchUpdateTransactions({
++      updated: [{ id: 'line1', date: '2024-02-01' }],
++    });
++
++    expect(await getLines()).toEqual([
++      { id: 'line1', date: 20240131, account: 'one' },
++      { id: 'line2', date: 20240131, account: 'one' },
++    ]);
++  });
++
++  it('moves the lines, and the transfer on a line, with the parent account', async () => {
++    await setup();
++
++    await batchUpdateTransactions({
++      updated: [{ id: 'parent', account: 'two' }],
++    });
++
++    expect(await getLines()).toEqual([
++      { id: 'line1', date: 20240131, account: 'two' },
++      { id: 'line2', date: 20240131, account: 'two' },
++    ]);
++    // The other side of the transfer line now comes from account two
++    const line2 = await db.getTransaction('line2');
++    const counterpart = await db.getTransaction(line2.transfer_id);
++    expect(counterpart.account).toBe('three');
++    expect(counterpart.payee).toBe('transfer-two');
++  });
++
++  it('gives lines moved by a merge the kept transaction date', async () => {
++    await setup();
++    // An imported duplicate a day later: merge keeps it and takes the lines
++    await db.insertTransaction({
++      id: 'imported',
++      account: 'one',
++      amount: -100,
++      date: '2024-02-01',
++      imported_id: 'bank-1',
++    });
++
++    expect(
++      await mergeTransactions([{ id: 'parent' }, { id: 'imported' }]),
++    ).toBe('imported');
++
++    const lines = await db.all<{ id: string; date: number }>(
++      `SELECT id, date FROM v_transactions_internal
++        WHERE parent_id = 'imported' AND tombstone = 0 ORDER BY id`,
++    );
++    expect(lines).toEqual([
++      { id: 'line1', date: 20240201 },
++      { id: 'line2', date: 20240201 },
++    ]);
++  });
++
++  it('repairs lines that were left on another date', async () => {
++    await setup();
++    // Bypass the batch update, as data from an older version or another
++    // device can arrive
++    await db.updateTransaction({ id: 'line1', date: '2023-12-15' });
++
++    expect(await alignSplitLines()).toEqual(['line1']);
++    expect(await getLines()).toEqual([
++      { id: 'line1', date: 20240131, account: 'one' },
++      { id: 'line2', date: 20240131, account: 'one' },
++    ]);
++    expect(await alignSplitLines()).toEqual([]);
++  });
++});
+diff --git a/packages/loot-core/src/server/transactions/split-lines.ts b/packages/loot-core/src/server/transactions/split-lines.ts
+new file mode 100644
+index 000000000..a2a33592f
+--- /dev/null
++++ b/packages/loot-core/src/server/transactions/split-lines.ts
+@@ -0,0 +1,57 @@
++import * as db from '#server/db';
++import { whereIn } from '#server/db/util';
++import { fromDateRepr } from '#server/models';
++
++/**
++ * Put every line of a split back on its parent's date and account.
++ *
++ * A split is one transaction, so its lines must always share the parent's
++ * date and account; otherwise a line can be counted in a different month
++ * or account than the rest of the split. Anything that moves only the
++ * parent or only a line (a rule setting the date, bank sync updating dates,
++ * a merge, an edit on another device) is corrected here, and the parent
++ * always wins.
++ *
++ * Pass the parent ids to check, or nothing to check every split. Returns the
++ * ids of the lines that were moved.
++ */
++export async function alignSplitLines(parentIds?: string[]): Promise<string[]> {
++  if (parentIds && parentIds.length === 0) {
++    return [];
++  }
++
++  const rows = await db.all<{ id: string; date: number; account: string }>(
++    `SELECT c.id, p.date, p.account
++       FROM v_transactions_internal_alive c
++       JOIN v_transactions_internal_alive p ON p.id = c.parent_id
++      WHERE c.is_child = 1 AND p.is_parent = 1
++        AND (c.date != p.date OR c.account != p.account)
++        ${parentIds ? 'AND ' + whereIn(parentIds, 'p.id') : ''}`,
++  );
++
++  for (const row of rows) {
++    await db.updateTransaction({
++      id: row.id,
++      date: fromDateRepr(row.date),
++      account: row.account,
++    });
++  }
++
++  return rows.map(row => row.id);
++}
++
++/**
++ * The parents of the splits that the given transactions belong to (a
++ * parent maps to itself, a line to its parent).
++ */
++export async function getSplitParentIds(ids: string[]): Promise<string[]> {
++  if (ids.length === 0) {
++    return [];
++  }
++  const rows = await db.all<{ parent: string }>(
++    `SELECT DISTINCT CASE WHEN is_child = 1 THEN parent_id ELSE id END AS parent
++       FROM v_transactions_internal
++      WHERE (is_parent = 1 OR is_child = 1) AND ${whereIn(ids, 'id')}`,
++  );
++  return rows.map(row => row.parent).filter(Boolean);
++}
+diff --git a/packages/loot-core/src/server/transactions/transaction-rules.test.ts b/packages/loot-core/src/server/transactions/transaction-rules.test.ts
+index dab7422a7..6c1dfbaef 100644
+--- a/packages/loot-core/src/server/transactions/transaction-rules.test.ts
++++ b/packages/loot-core/src/server/transactions/transaction-rules.test.ts
+@@ -877,6 +877,97 @@ describe('Transaction rules', () => {
+     expect(transactions.map(t => t.id)).toEqual(['1']);
+   });
+ 
++  test('a notes regex with uppercase escapes is queried as typed and ignores case', async () => {
++    await loadRules();
++    const account = await db.insertAccount({ name: 'bank' });
++
++    await db.insertTransaction({
++      id: '1',
++      date: '2020-10-01',
++      account,
++      notes: 'Groceries',
++      amount: 100,
++    });
++    await db.insertTransaction({
++      id: '2',
++      date: '2020-10-01',
++      account,
++      notes: 'Invoice 42',
++      amount: 100,
++    });
++
++    const noDigits = await getMatchingTransactions([
++      { field: 'notes', op: 'matches', value: '^\\D+$' },
++    ]);
++    expect(noDigits.map(t => t.id)).toEqual(['1']);
++
++    const upperCasePattern = await getMatchingTransactions([
++      { field: 'notes', op: 'matches', value: '^INVOICE \\d+$' },
++    ]);
++    expect(upperCasePattern.map(t => t.id)).toEqual(['2']);
++  });
++
++  test('tag rules apply to exactly the transactions the tag query shows', async () => {
++    await loadRules();
++    const account = await db.insertAccount({ name: 'bank' });
++
++    const notesById = {
++      '1': 'Lunch #food',
++      '2': 'Lunch #Food',
++      '3': 'Lunch #FOOD',
++      '4': 'Groceries #foodbank',
++      '5': 'Escaped ##food',
++      '6': '#food#work',
++      '7': 'Trip #work',
++      '8': 'Fee #$tax',
++      '9': 'Nothing to see',
++      '10': 'Dinner #food.',
++    };
++    for (const [id, notes] of Object.entries(notesById)) {
++      await db.insertTransaction({
++        id,
++        date: '2020-10-01',
++        account,
++        notes,
++        amount: 100,
++      });
++    }
++
++    const conditions = [
++      { field: 'notes', op: 'hasTags', value: '#food' },
++      { field: 'notes', op: 'hasTags', value: '#Food' },
++      { field: 'notes', op: 'hasTags', value: 'food work' },
++      { field: 'notes', op: 'hasTags', value: '#$tax' },
++      { field: 'notes', op: 'hasAnyTag', value: '#FOOD #work' },
++      { field: 'notes', op: 'hasAnyTag', value: '#food.' },
++    ];
++
++    for (const condition of conditions) {
++      const queried = (await getMatchingTransactions([condition]))
++        .map(t => t.id)
++        .sort();
++      const cond = new Condition(
++        condition.op,
++        condition.field,
++        condition.value,
++        null,
++      );
++      const evaluated = Object.entries(notesById)
++        .filter(([, notes]) => cond.eval({ notes }))
++        .map(([id]) => id)
++        .sort();
++      expect({ condition, ids: evaluated }).toEqual({
++        condition,
++        ids: queried,
++      });
++    }
++
++    // Tags are case sensitive, as everywhere else tags are used
++    const food = new Condition('hasTags', 'notes', '#food', null);
++    expect(food.eval({ notes: 'Lunch #food' })).toBe(true);
++    expect(food.eval({ notes: 'Lunch #Food' })).toBe(false);
++  });
++
+   test('transactions can be queried by hasTags if no "#" is included', async () => {
+     await loadRules();
+     const account = await db.insertAccount({ name: 'bank' });
+@@ -1536,6 +1627,60 @@ describe('Learning categories', () => {
+     expect(getRules()[0].conditions[0].op).toBe('oneOf');
+   });
+ 
++  test('does not rewrite a "payee is not" rule when learning a category', async () => {
++    await loadData();
++
++    await insertRule({
++      stage: null,
++      conditionsOp: 'and',
++      conditions: [{ op: 'isNot', field: 'payee', value: 'foo' }],
++      actions: [{ op: 'set', field: 'category', value: 'beer' }],
++    });
++
++    const trans = {
++      date: '2016-12-01',
++      account: 'acct',
++      payee: 'foo',
++      category: 'food',
++    };
++    await db.insertTransaction({ ...trans, id: 'one' });
++    await db.insertTransaction({ ...trans, id: 'two' });
++    await db.insertTransaction({ ...trans, id: 'three' });
++    await updateCategoryRules([{ ...trans, id: 'three' }]);
++
++    const rules = getRules();
++    expect(rules.length).toBe(2);
++    const isNotRule = rules.find(r => r.conditions[0].op === 'isNot');
++    expect(isNotRule.actions[0].value).toBe('beer');
++    expectCategoryRule(
++      rules.find(r => r.conditions[0].op === 'is'),
++      'food',
++      'foo',
++    );
++  });
++
++  test('runs a rule that excludes payees on both indexed fields', async () => {
++    await loadData();
++
++    await insertRule({
++      stage: null,
++      conditionsOp: 'and',
++      conditions: [
++        { op: 'isNot', field: 'imported_payee', value: 'Amazon' },
++        { op: 'isNot', field: 'payee', value: 'foo' },
++      ],
++      actions: [{ op: 'set', field: 'notes', value: 'matched' }],
++    });
++
++    const result = await runRules({
++      date: '2016-12-01',
++      account: 'acct',
++      imported_payee: 'Walmart',
++      payee: 'bar',
++    });
++    expect(result.notes).toBe('matched');
++  });
++
+   test('creates a rule if a "one of" rule sets a different category', async () => {
+     await loadData();
+ 
+diff --git a/packages/loot-core/src/server/transactions/transaction-rules.ts b/packages/loot-core/src/server/transactions/transaction-rules.ts
+index e3f1b2c3a..3e0712d8e 100644
+--- a/packages/loot-core/src/server/transactions/transaction-rules.ts
++++ b/packages/loot-core/src/server/transactions/transaction-rules.ts
+@@ -717,7 +717,9 @@ export function conditionsToAQL(
+       case 'matches':
+         // Running contains with id will automatically reach into
+         // the `name` of the referenced table and do a regex match
+-        return apply(type === 'id' ? field + '.name' : field, '$regexp', value);
++        return {
++          [type === 'id' ? field + '.name' : field]: { $regexpnocase: value },
++        };
+       case 'doesNotContain':
+         // Running contains with id will automatically reach into
+         // the `name` of the referenced table and do a string match
+@@ -899,7 +901,7 @@ function* getIsSetterRules(
+       rule.actions[0].field === actionField &&
+       (actionValue === undefined || rule.actions[0].value === actionValue) &&
+       rule.conditions.length === 1 &&
+-      (rule.conditions[0].op === 'is' || rule.conditions[0].op === 'isNot') &&
++      rule.conditions[0].op === 'is' &&
+       rule.conditions[0].field === condField &&
+       (condValue === undefined || rule.conditions[0].value === condValue)
+     ) {
+diff --git a/packages/loot-core/src/server/transactions/transfer.test.ts b/packages/loot-core/src/server/transactions/transfer.test.ts
+index e86b68c54..4ea8080e7 100644
+--- a/packages/loot-core/src/server/transactions/transfer.test.ts
++++ b/packages/loot-core/src/server/transactions/transfer.test.ts
+@@ -1,7 +1,9 @@
+ // @ts-strict-ignore
+ import { expectSnapshotWithDiffer } from '#mocks/util';
+ import * as db from '#server/db';
++import { setSyncingMode } from '#server/sync';
+ 
++import { findDuplicateImports } from './duplicate-imports';
+ import * as transfer from './transfer';
+ 
+ beforeEach(global.emptyDatabase());
+@@ -219,3 +221,107 @@ describe('Transfer', () => {
+     expect(child.payee).toBe(transferOne.id);
+   });
+ });
++
++describe('Transfers edited on more than one device', () => {
++  beforeEach(() => {
++    setSyncingMode('enabled');
++  });
++  afterEach(() => {
++    setSyncingMode('disabled');
++  });
++
++  async function makeTransfer() {
++    await prepareDatabase();
++    const transferTwo = await db.first<db.DbPayee>(
++      "SELECT * FROM payees WHERE transfer_acct = 'two'",
++    );
++    const transaction: Transaction = {
++      account: 'one',
++      amount: -5000,
++      payee: transferTwo.id,
++      date: '2017-01-01',
++    };
++    transaction.id = await db.insertTransaction(transaction);
++    await transfer.onInsert(transaction);
++    return db.getTransaction(transaction.id);
++  }
++
++  function amountMessages(id: string) {
++    return db.all<{ timestamp: string }>(
++      `SELECT timestamp FROM messages_crdt
++        WHERE dataset = 'transactions' AND row = ? AND column = 'amount'`,
++      [id],
++    );
++  }
++
++  test('editing the notes does not rewrite the amount on the other side', async () => {
++    const transaction = await makeTransfer();
++    const before = await amountMessages(transaction.transfer_id);
++
++    await db.updateTransaction({ id: transaction.id, notes: 'hello' });
++    await transfer.onUpdate(await db.getTransaction(transaction.id));
++
++    // A rewrite of the unchanged amount could override an amount edit
++    // made on another device at the same time
++    expect(await amountMessages(transaction.transfer_id)).toEqual(before);
++    expect((await db.getTransaction(transaction.transfer_id)).notes).toBe(
++      'hello',
++    );
++  });
++
++  test('mismatched amounts are reported and both figures are kept', async () => {
++    const transaction = await makeTransfer();
++
++    // What a sync can leave behind when both sides were edited at once
++    await db.updateTransaction({ id: transaction.transfer_id, amount: 7000 });
++
++    const mismatches = await transfer.findTransferMismatches();
++    expect(mismatches).toHaveLength(1);
++    expect(
++      [
++        [mismatches[0].accountName, mismatches[0].amount],
++        [mismatches[0].otherAccountName, mismatches[0].otherAmount],
++      ].sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
++    ).toEqual([
++      ['one', -5000],
++      ['two', 7000],
++    ]);
++    // Nothing was overwritten
++    expect((await db.getTransaction(transaction.id)).amount).toBe(-5000);
++    expect((await db.getTransaction(transaction.transfer_id)).amount).toBe(
++      7000,
++    );
++
++    // Editing one side resolves it
++    await db.updateTransaction({ id: transaction.id, amount: -7000 });
++    await transfer.onUpdate(await db.getTransaction(transaction.id));
++    expect(await transfer.findTransferMismatches()).toEqual([]);
++  });
++});
++
++describe('Duplicate bank transactions', () => {
++  test('are reported, not merged', async () => {
++    await prepareDatabase();
++    for (const id of ['copy-a', 'copy-b']) {
++      await db.insertTransaction({
++        id,
++        account: 'one',
++        amount: -1250,
++        date: '2026-11-02',
++        imported_id: 'bank-1',
++      });
++    }
++
++    expect(await findDuplicateImports()).toEqual([
++      {
++        accountName: 'one',
++        importedId: 'bank-1',
++        count: 2,
++        date: '2026-11-02',
++        amount: -1250,
++      },
++    ]);
++    expect(await db.getTransaction('copy-a')).toBeTruthy();
++    expect(await db.getTransaction('copy-b')).toBeTruthy();
++  });
++});
+diff --git a/packages/loot-core/src/server/transactions/transfer.ts b/packages/loot-core/src/server/transactions/transfer.ts
+index 70cb9110d..64a8a81ab 100644
+--- a/packages/loot-core/src/server/transactions/transfer.ts
++++ b/packages/loot-core/src/server/transactions/transfer.ts
+@@ -1,5 +1,7 @@
+ // @ts-strict-ignore
++import { unusedStableId } from '#server/accounts/stable-ids';
+ import * as db from '#server/db';
++import { fromDateRepr } from '#server/models';
+ 
+ import { runRules } from './transaction-rules';
+ 
+@@ -72,6 +74,15 @@ export async function addTransfer(transaction, transferredAccount) {
+   const matchedSchedule = schedule ?? transaction.schedule;
+ 
+   const id = await db.insertTransaction({
++    // Derived from this side, so when two devices turn the same transaction
++    // into a transfer (for example a rule run by both while importing the
++    // same bank data) they create the same other side, not one each
++    id: await unusedStableId(
++      'transactions',
++      'transfer',
++      transaction.id,
++      transferredAccount,
++    ),
+     ...transferTransaction,
+     notes,
+     cleared,
+@@ -120,8 +131,7 @@ export async function removeTransfer(transaction) {
+ export async function updateTransfer(transaction, transferredAccount) {
+   const payee = await getPayee(transaction.account);
+ 
+-  await db.updateTransaction({
+-    id: transaction.transfer_id,
++  const mirrored = {
+     account: transferredAccount,
+     // Make sure to update the payee on the other side in case the
+     // user moved this transaction into another account
+@@ -129,7 +139,25 @@ export async function updateTransfer(transaction, transferredAccount) {
+     notes: transaction.notes,
+     amount: -transaction.amount,
+     schedule: transaction.schedule,
+-  });
++  };
++
++  // Only write the fields that actually differ. Every write is a sync
++  // message, and rewriting an unchanged field can win over a real change
++  // made at the same time on another device: editing the notes on one
++  // laptop would otherwise reset an amount just changed on the other,
++  // leaving the two sides of the transfer with different amounts.
++  const counterpart = await db.getTransaction(transaction.transfer_id);
++  const changed = counterpart
++    ? Object.fromEntries(
++        Object.entries(mirrored).filter(
++          ([field, value]) => (counterpart[field] ?? null) !== (value ?? null),
++        ),
++      )
++    : mirrored;
++
++  if (Object.keys(changed).length > 0) {
++    await db.updateTransaction({ id: transaction.transfer_id, ...changed });
++  }
+ 
+   const categoryCleared = await clearCategory(transaction, transferredAccount);
+   if (categoryCleared) {
+@@ -137,6 +165,62 @@ export async function updateTransfer(transaction, transferredAccount) {
+   }
+ }
+ 
++export type TransferMismatch = {
++  id: string;
++  date: string;
++  accountName: string;
++  amount: number;
++  otherId: string;
++  otherDate: string;
++  otherAccountName: string;
++  otherAmount: number;
++};
++
++/**
++ * Find transfers whose two sides no longer mirror each other's amount.
++ *
++ * Each edit updates both sides, but sync resolves every field on its own.
++ * When two devices change the two sides of the same transfer at the same
++ * time, each side can keep a different device's amount. There is no safe
++ * way to tell which amount is right, so nothing is changed here: the
++ * mismatches are reported so someone can decide; changing the wrong side
++ * to the right amount puts the pair back in line.
++ */
++export async function findTransferMismatches(): Promise<TransferMismatch[]> {
++  const rows = await db.all<{
++    id: string;
++    date: number;
++    account_name: string;
++    amount: number;
++    other_id: string;
++    other_date: number;
++    other_account_name: string;
++    other_amount: number;
++  }>(
++    `SELECT t1.id, t1.date, a1.name AS account_name, t1.amount,
++            t2.id AS other_id, t2.date AS other_date,
++            a2.name AS other_account_name, t2.amount AS other_amount
++       FROM v_transactions_internal_alive t1
++       JOIN v_transactions_internal_alive t2
++         ON t2.id = t1.transfer_id AND t2.transfer_id = t1.id
++       LEFT JOIN accounts a1 ON a1.id = t1.account
++       LEFT JOIN accounts a2 ON a2.id = t2.account
++      WHERE t1.amount != -t2.amount AND t1.id < t2.id
++      ORDER BY t1.date DESC, t1.id`,
++  );
++
++  return rows.map(row => ({
++    id: row.id,
++    date: fromDateRepr(row.date),
++    accountName: row.account_name,
++    amount: row.amount,
++    otherId: row.other_id,
++    otherDate: fromDateRepr(row.other_date),
++    otherAccountName: row.other_account_name,
++    otherAmount: row.other_amount,
++  }));
++}
++
+ export async function onInsert(transaction) {
+   const transferredAccount = await getTransferredAccount(transaction);
+ 
+diff --git a/packages/loot-core/src/types/server-events.ts b/packages/loot-core/src/types/server-events.ts
+index c9352b51b..5acfa12fa 100644
+--- a/packages/loot-core/src/types/server-events.ts
++++ b/packages/loot-core/src/types/server-events.ts
+@@ -109,6 +109,38 @@ type PrefsUpdatedEvent = undefined;
+ // IndexedDB blocks into the sqlite-wasm storage
+ type StorageMigrationEvent = { phase: MigrationPhase; percent?: number };
+ type SchedulesOfflineEvent = undefined;
++type DuplicateImportsEvent = {
++  duplicates: Array<{
++    accountName: string;
++    importedId: string;
++    count: number;
++    date: string;
++    amount: number;
++  }>;
++};
++type TransferMismatchesEvent = {
++  mismatches: Array<{
++    id: string;
++    date: string;
++    accountName: string;
++    amount: number;
++    otherId: string;
++    otherDate: string;
++    otherAccountName: string;
++    otherAmount: number;
++  }>;
++};
++type OpeningBalanceConflictsEvent = {
++  conflicts: Array<{
++    accountName: string;
++    date: string;
++    amount: number;
++    otherDate: string;
++    otherAmount: number;
++    expectedAmount: number;
++    removed: boolean;
++  }>;
++};
+ type ServerErrorEvent = undefined;
+ type ShowBudgetsEvent = undefined;
+ type StartImportEvent = { budgetName: string };
+@@ -128,6 +160,9 @@ export type ServerEvents = {
+   'orphaned-payees': OrphanedPayeesEvent;
+   'prefs-updated': PrefsUpdatedEvent;
+   'schedules-offline': SchedulesOfflineEvent;
++  'transfer-mismatches': TransferMismatchesEvent;
++  'duplicate-imports': DuplicateImportsEvent;
++  'opening-balance-conflicts': OpeningBalanceConflictsEvent;
+   'server-error': ServerErrorEvent;
+   'show-budgets': ShowBudgetsEvent;
+   'start-import': StartImportEvent;
+diff --git a/upcoming-release-notes/fix-rules-schedules-budgets-imports.md b/upcoming-release-notes/fix-rules-schedules-budgets-imports.md
+new file mode 100644
+index 000000000..3f9a011b6
+--- /dev/null
++++ b/upcoming-release-notes/fix-rules-schedules-budgets-imports.md
+@@ -0,0 +1,6 @@
++---
++category: Bugfix
++authors: [YOUR_GITHUB_USERNAME]
++---
++
++Fix duplicate transactions and payees, and wrong opening balances, when two devices link or import the same bank account before syncing with each other, stop deleted pending bank transactions coming back once they are booked, warn instead of guessing when a transfer gets different amounts on each side from two devices, keep split lines in the same month and account as their split, and fix tag and "matches" rules, "is not" rules, schedule detection, 6 and 12 month budget averages, template goals, bank opening balance dates and some OFX and CAMT imports
